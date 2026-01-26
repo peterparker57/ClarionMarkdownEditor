@@ -11,7 +11,9 @@
          class="ClarionMarkdownEditor.MarkdownEditorPad"/>
   </Path>
   <Path name="/Workspace/Tools">
-    <MenuItem id="ShowMarkdownEditor" label="Markdown Editor"
+    <MenuItem id="ShowMarkdownEditor" label="Markdown Editor (Pad)"
               class="ClarionMarkdownEditor.ShowMarkdownEditorCommand"/>
+    <MenuItem id="ShowMarkdownEditorWindow" label="Markdown Editor (Window)"
+              class="ClarionMarkdownEditor.ShowMarkdownEditorWindowCommand"/>
   </Path>
 </AddIn>
