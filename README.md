@@ -182,9 +182,9 @@ You can open ClarionMarkdownEditor.slnx in any of the following:
 ## Screenshots
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│ New  Open  Save  Save As │ Insert to IDE │ filename.md     │
+│ New  Open  Save  Save As │ Insert to IDE │ filename.md      │
 ├─────────────────────────────────────────────────────────────┤
-│ B │ I │ </> │ {} │ Link │ Img │ H1 │ H2 │ H3 │ List │ ...  │
+│ B │ I │ </> │ {} │ Link │ Img │ H1 │ H2 │ H3 │ List │ ...   │
 ├────────────────────────────┬────────────────────────────────┤
 │ MARKDOWN                   │ PREVIEW                [Expand]│
 ├────────────────────────────┼────────────────────────────────┤
