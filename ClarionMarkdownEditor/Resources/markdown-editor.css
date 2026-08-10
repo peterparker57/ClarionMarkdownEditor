@@ -168,6 +168,14 @@
         .tab .tab-title { flex: 1; overflow: hidden; text-overflow: ellipsis; }
         .tab .tab-dirty { color: #ffc107; margin-right: 4px; font-weight: bold; }
         .tab .tab-lock { margin-right: 4px; font-size: 11px; opacity: 0.85; }
+        .tab .tab-changed {
+            color: #ffc107;
+            margin-right: 4px;
+            font-weight: bold;
+            cursor: pointer;
+            line-height: 1;
+        }
+        .tab .tab-changed:hover { color: #ffdb70; }
         .tab.tab-readonly { font-style: italic; }
         .tab .tab-close {
             margin-left: 8px;
