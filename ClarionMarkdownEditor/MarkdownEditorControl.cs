@@ -19,6 +19,12 @@ namespace ClarionMarkdownEditor
         public string FileName { get; set; }
         public bool IsDirty { get; set; }
 
+        // Last content we synced with disk (line endings normalized to \n). Used by
+        // the file watcher to distinguish an external edit from our own save / a
+        // no-op touch: if the newly-read disk content equals this, there's nothing
+        // to do. Set whenever we load from or write to the file.
+        public string DiskContent { get; set; }
+
         // Set when the tab was loaded from a URL (Open Markdown from URL...). Carries the
         // resolved fetch URL so relative-link clicks and "Save a copy" can resolve correctly.
         public string SourceUrl { get; set; }
@@ -71,6 +77,10 @@ namespace ClarionMarkdownEditor
         // Message filter for closing menus when clicking WebView2
         private WebView2MenuCloseFilter _menuCloseFilter;
 
+        // Watches the on-disk files backing open tabs so external edits (Claude/CA,
+        // VS Code, etc.) auto-refresh clean tabs and flag dirty ones.
+        private readonly TabFileWatcher _fileWatcher;
+
         // All live instances (pad + document) — used for cross-instance file collision detection
         private static readonly List<MarkdownEditorControl> _allInstances = new List<MarkdownEditorControl>();
         private static readonly object _allInstancesLock = new object();
@@ -78,6 +88,8 @@ namespace ClarionMarkdownEditor
         partial void OnCustomDispose()
         {
             lock (_allInstancesLock) _allInstances.Remove(this);
+
+            _fileWatcher?.Dispose();
 
             if (_menuCloseFilter != null)
             {
@@ -98,6 +110,11 @@ namespace ClarionMarkdownEditor
             InitializeComponent();
             _editorService = new EditorService();
             _settingsService = new SettingsService();
+
+            // Auto-refresh: watch backing files for external changes.
+            _fileWatcher = new TabFileWatcher(this);
+            _fileWatcher.FileChanged += OnDiskFileChanged;
+            _fileWatcher.FileRemoved += OnDiskFileRemoved;
 
             // Install message filter to close menus when clicking inside WebView2
             _menuCloseFilter = new WebView2MenuCloseFilter(this, webView, menuStrip);
@@ -972,7 +989,8 @@ namespace ClarionMarkdownEditor
                 Id = tabId,
                 FilePath = filePath,
                 FileName = fileName,
-                IsDirty = false
+                IsDirty = false,
+                DiskContent = NormalizeLineEndings(content)
             };
 
             _openTabs[tabId] = tab;
@@ -982,6 +1000,8 @@ namespace ClarionMarkdownEditor
 
             // Call JavaScript to add the tab
             AddTabToJs(tabId, fileName, content, filePath);
+
+            _fileWatcher.Watch(filePath);
 
             AddToRecentFiles(filePath);
             _ = RefreshRecentFilesInStartPage();
@@ -1064,6 +1084,7 @@ namespace ClarionMarkdownEditor
             {
                 File.WriteAllText(activeTab.FilePath, content);
                 activeTab.IsDirty = false;
+                activeTab.DiskContent = NormalizeLineEndings(content);
                 _currentFilePath = activeTab.FilePath;
                 SendMessageToJs("fileSaved", activeTab.FilePath);
                 ClearDirtyIndicatorInJs(_activeTabId);
@@ -1103,12 +1124,23 @@ namespace ClarionMarkdownEditor
                         // Saving a URL-loaded tab locally promotes it to a regular
                         // editable file tab — clear the read-only / URL provenance.
                         bool wasReadOnly = activeTab.IsReadOnly;
+                        var previousPath = activeTab.FilePath;
                         activeTab.FilePath = dialog.FileName;
                         activeTab.FileName = Path.GetFileName(dialog.FileName);
                         activeTab.IsDirty = false;
                         activeTab.IsReadOnly = false;
                         activeTab.SourceUrl = null;
                         activeTab.SourceBaseUrl = null;
+                        activeTab.DiskContent = NormalizeLineEndings(content);
+
+                        // Point the watcher at the new file (Save As to a different
+                        // path, or a URL/untitled tab becoming a real file).
+                        if (!string.IsNullOrEmpty(previousPath) &&
+                            !string.Equals(previousPath, dialog.FileName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            _fileWatcher.Unwatch(previousPath);
+                        }
+                        _fileWatcher.Watch(dialog.FileName);
 
                         _currentFilePath = dialog.FileName;
 
@@ -1375,6 +1407,8 @@ namespace ClarionMarkdownEditor
             }
 
             // Remove the tab
+            if (!string.IsNullOrEmpty(tab.FilePath))
+                _fileWatcher.Unwatch(tab.FilePath);
             _openTabs.Remove(tabId);
             RemoveTabFromJs(tabId);
 
@@ -1488,6 +1522,15 @@ namespace ClarionMarkdownEditor
 
                     case "saveRequested":
                         SaveMarkdownFile();
+                        break;
+
+                    case "reloadRequested":
+                        {
+                            // User clicked the "changed on disk" badge on a tab.
+                            var tabId = ExtractNestedJsonValue(message, "data", "tabId");
+                            if (!string.IsNullOrEmpty(tabId))
+                                BeginInvoke(new Action(() => ReloadTabFromDisk(tabId, promptIfDirty: true)));
+                        }
                         break;
 
                     case "openUrl":
@@ -1724,6 +1767,10 @@ namespace ClarionMarkdownEditor
                     {
                         SaveMarkdownFileAs();
                     }
+                    break;
+
+                case "Reload":
+                    ReloadTabFromDisk(tabId, promptIfDirty: true);
                     break;
 
                 case "CopyPath":
@@ -2145,6 +2192,158 @@ namespace ClarionMarkdownEditor
                 SendContentToJs(content, _currentFilePath);
             }
         }
+
+        #region Auto-refresh (file watcher)
+
+        /// <summary>
+        /// Normalizes line endings to \n — the same form used when handing content
+        /// to the JavaScript editor — so on-disk and in-editor content compare equal.
+        /// </summary>
+        private static string NormalizeLineEndings(string content)
+        {
+            if (string.IsNullOrEmpty(content)) return content ?? string.Empty;
+            return content.Replace("\r\n", "\n").Replace("\r", "\n");
+        }
+
+        /// <summary>
+        /// Fired (on the UI thread) when a watched file changed on disk. Clean tabs
+        /// reload silently; tabs with unsaved edits get a passive "changed on disk"
+        /// badge so the user can resolve the conflict without losing work.
+        /// </summary>
+        private void OnDiskFileChanged(string filePath, string diskContent)
+        {
+            var tab = FindTabByPath(filePath);
+            if (tab == null) return;
+
+            string normalized = NormalizeLineEndings(diskContent);
+
+            // Our own save, or a touch that didn't actually change the text.
+            if (string.Equals(normalized, tab.DiskContent, StringComparison.Ordinal))
+                return;
+
+            tab.DiskContent = normalized;
+
+            if (!tab.IsDirty)
+            {
+                ReloadTabContentInJs(tab.Id, normalized);
+                SendMessageToJs("statusMessage", $"Reloaded {tab.FileName} — changed on disk");
+            }
+            else
+            {
+                // Don't clobber unsaved edits — flag for the user to resolve.
+                SetTabExternallyChangedInJs(tab.Id, true, false);
+            }
+        }
+
+        /// <summary>
+        /// Fired (on the UI thread) when a watched file was deleted/renamed away.
+        /// Keeps the in-editor buffer; just flags the tab.
+        /// </summary>
+        private void OnDiskFileRemoved(string filePath)
+        {
+            var tab = FindTabByPath(filePath);
+            if (tab == null) return;
+            SetTabExternallyChangedInJs(tab.Id, true, true);
+        }
+
+        private FileTab FindTabByPath(string filePath)
+        {
+            return _openTabs.Values.FirstOrDefault(t =>
+                !string.IsNullOrEmpty(t.FilePath) &&
+                string.Equals(t.FilePath, filePath, StringComparison.OrdinalIgnoreCase));
+        }
+
+        /// <summary>
+        /// Reloads a tab from its backing file. If the tab has unsaved edits and
+        /// <paramref name="promptIfDirty"/> is set, confirms before discarding them.
+        /// Invoked by the "Reload from disk" context-menu item and the badge click.
+        /// </summary>
+        private void ReloadTabFromDisk(string tabId, bool promptIfDirty)
+        {
+            if (!_openTabs.TryGetValue(tabId, out var tab)) return;
+
+            if (string.IsNullOrEmpty(tab.FilePath))
+            {
+                MessageBox.Show("This tab isn't saved to a file yet, so there's nothing to reload.",
+                    "Reload from Disk", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (!File.Exists(tab.FilePath))
+            {
+                MessageBox.Show($"The file no longer exists:\n{tab.FilePath}",
+                    "Reload from Disk", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (promptIfDirty && tab.IsDirty)
+            {
+                var result = MessageBox.Show(
+                    $"{tab.FileName} has unsaved changes, and the file has also changed on disk.\n\n" +
+                    "Load the version from disk and discard your unsaved changes?",
+                    "Reload from Disk",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+                if (result != DialogResult.Yes) return;
+            }
+
+            string content;
+            try
+            {
+                content = File.ReadAllText(tab.FilePath);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Couldn't read the file:\n{ex.Message}",
+                    "Reload from Disk", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            string normalized = NormalizeLineEndings(content);
+            tab.DiskContent = normalized;
+            tab.IsDirty = false;
+            ReloadTabContentInJs(tabId, normalized);
+        }
+
+        /// <summary>
+        /// Calls JavaScript to replace a tab's content in place (preserving scroll)
+        /// and clear its dirty / changed-on-disk state.
+        /// </summary>
+        private async void ReloadTabContentInJs(string tabId, string content)
+        {
+            if (!_isWebView2Ready) return;
+            try
+            {
+                string escapedId = EscapeJsString(tabId);
+                string escapedContent = EscapeJsString(content);
+                await webView.ExecuteScriptAsync($"reloadTabContent(\"{escapedId}\", \"{escapedContent}\")");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"ReloadTabContentInJs error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Calls JavaScript to toggle a tab's "changed on disk" badge.
+        /// </summary>
+        private async void SetTabExternallyChangedInJs(string tabId, bool changed, bool deleted)
+        {
+            if (!_isWebView2Ready) return;
+            try
+            {
+                string escapedId = EscapeJsString(tabId);
+                string changedArg = changed ? "true" : "false";
+                string deletedArg = deleted ? "true" : "false";
+                await webView.ExecuteScriptAsync(
+                    $"setTabExternallyChanged(\"{escapedId}\", {changedArg}, {deletedArg})");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"SetTabExternallyChangedInJs error: {ex.Message}");
+            }
+        }
+
+        #endregion
     }
 
     /// <summary>

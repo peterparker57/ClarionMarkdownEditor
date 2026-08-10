@@ -244,6 +244,83 @@
             updateTabDirty(tabId, dirty);
         }
 
+        // Replace a tab's content in place from an external (on-disk) change,
+        // preserving scroll for the active tab and clearing dirty + changed-on-disk
+        // state. content already uses \n line endings (normalized in C#).
+        function reloadTabContent(tabId, content) {
+            if (!tabs[tabId]) return;
+            tabs[tabId].content = content;
+            tabs[tabId].cleanContent = content;
+            tabs[tabId].isDirty = false;
+            updateTabDirty(tabId, false);
+            setTabExternallyChanged(tabId, false, false);
+
+            if (tabId === activeTabId) {
+                // Preserve scroll positions across the reload.
+                var edRatio = scrollRatio(editor);
+                var pvRatio = scrollRatio(preview);
+                editor.value = content;
+                updatePreview();
+                requestAnimationFrame(function () {
+                    applyScrollRatio(editor, edRatio);
+                    applyScrollRatio(preview, pvRatio);
+                });
+            }
+        }
+
+        function scrollRatio(el) {
+            if (!el) return 0;
+            var denom = el.scrollHeight - el.clientHeight;
+            if (denom <= 0) return 0;
+            var r = el.scrollTop / denom;
+            return isNaN(r) ? 0 : r;
+        }
+
+        function applyScrollRatio(el, ratio) {
+            if (!el) return;
+            var denom = el.scrollHeight - el.clientHeight;
+            if (denom > 0) el.scrollTop = ratio * denom;
+        }
+
+        // Show/hide a "changed on disk" badge on a tab. deleted=true tweaks the
+        // tooltip. Clicking the badge asks C# to reload the tab from disk.
+        function setTabExternallyChanged(tabId, changed, deleted) {
+            if (!tabs[tabId]) return;
+            tabs[tabId].externallyChanged = !!changed;
+
+            var tabEl = tabBar.querySelector('[data-tab-id="' + tabId + '"]');
+            if (!tabEl) return;
+
+            var badge = tabEl.querySelector('.tab-changed');
+            if (changed) {
+                if (!badge) {
+                    badge = document.createElement('span');
+                    badge.className = 'tab-changed';
+                    badge.textContent = '↻'; // ↻
+                    badge.addEventListener('click', function (e) {
+                        e.stopPropagation();
+                        notifyReloadRequested(tabId);
+                    });
+                    // Place it just before the close button.
+                    var closeEl = tabEl.querySelector('.tab-close');
+                    if (closeEl) tabEl.insertBefore(badge, closeEl);
+                    else tabEl.appendChild(badge);
+                }
+                badge.title = deleted
+                    ? 'File was deleted on disk — click to reload'
+                    : 'File changed on disk — click to reload';
+                badge.style.display = 'inline';
+            } else if (badge) {
+                badge.remove();
+            }
+        }
+
+        function notifyReloadRequested(tabId) {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({ type: 'reloadRequested', data: { tabId: tabId } });
+            }
+        }
+
         // Get content of the active tab
         function getActiveTabContent() {
             if (activeTabId && tabs[activeTabId]) {
@@ -311,6 +388,9 @@
                     break;
                 case 'saveAs':
                     notifyContextMenuAction('SaveAs', tabId);
+                    break;
+                case 'reloadFromDisk':
+                    notifyContextMenuAction('Reload', tabId);
                     break;
                 case 'copyPath':
                     notifyContextMenuAction('CopyPath', tabId);
