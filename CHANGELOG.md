@@ -10,6 +10,21 @@ Contributors:
 
 --- 
 
+## v1.3.0 — 2026-08-10 — Auto-refresh open tabs when files change on disk
+
+### Added
+- **Auto-refresh on external file changes** ([#11](https://github.com/msarson/ClarionMarkdownEditor/issues/11), reported by Kevin Erskine). Open tabs now track their backing file on disk and update themselves when the file is changed by something outside the editor (CA/Claude editing a Markdown file you're viewing, or the same file open in VS Code). No more stale views and no manual reload needed for the common case.
+  - A new `Services/TabFileWatcher.cs` runs one `FileSystemWatcher` per directory that holds an open file, filtered to the watched files. Raw filesystem events are marshalled onto the UI thread and debounced (~250 ms) to coalesce the burst of events editors emit per save; reads use `FileShare.ReadWrite` with a short retry so a file still held open by the writer doesn't throw.
+  - **Clean tabs reload silently and in place**, preserving the editor/preview scroll position (via `reloadTabContent` in `markdown-editor.js`) — the view stays roughly where you were reading.
+  - **Tabs with unsaved edits are never clobbered.** Instead a passive **↻ "changed on disk"** badge appears on the tab; clicking it (or **Reload from Disk** in the tab context menu) prompts before discarding your changes. Deleted/renamed files flag the tab the same way and keep the in-editor buffer intact.
+  - Each tab carries a `DiskContent` baseline so the editor's *own* saves (and no-op touches) are recognized and ignored — the watcher only reacts to genuine external changes.
+- **"Reload from Disk"** tab context-menu item and badge-click action, both routed through a single `ReloadTabFromDisk` path that confirms before overwriting unsaved edits.
+
+### Notes
+- The in-place reload preserves **scroll**, not the caret, because the editor is a plain `<textarea>` (a character offset can't track its logical line when text shifts above it). True VS-Code-style caret + view tracking is deferred to the CodeMirror 6 migration ([#10](https://github.com/msarson/ClarionMarkdownEditor/issues/10)), where reload can be dispatched as a mapped change transaction.
+
+---
+
 ## v1.2.0 — 2026-05-17 — Bundle marked@11, drop inline parser
 
 ### Changed
