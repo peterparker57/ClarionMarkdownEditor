@@ -97,6 +97,27 @@
         .preview-pane.fullscreen { flex: 1; border-left: none; }
         .format-toolbar.hidden { display: none; }
 
+        /* Draggable splitter between editor and preview panes */
+        .pane-splitter {
+            flex: 0 0 6px;
+            background: #ccc;
+            cursor: col-resize;
+            position: relative;
+            z-index: 5;
+        }
+        .pane-splitter:hover,
+        .pane-splitter.dragging { background: #4a90d9; }
+        /* Horizontal (stacked) split → drag vertically */
+        .editor-container.horizontal-split .pane-splitter { cursor: row-resize; flex-basis: 6px; }
+        /* Hide the splitter when the editor pane is collapsed (fullscreen preview) */
+        .editor-pane.hidden ~ .pane-splitter { display: none; }
+        /* While dragging, don't let the panes swallow the mouse (text selection, etc.) */
+        .editor-container.resizing .editor-pane,
+        .editor-container.resizing .preview-pane { pointer-events: none; user-select: none; }
+        body.dark-mode .pane-splitter { background: #3e3e3e; }
+        body.dark-mode .pane-splitter:hover,
+        body.dark-mode .pane-splitter.dragging { background: #4a90d9; }
+
         /* Horizontal split mode (stacked top/bottom) */
         .editor-container.horizontal-split { flex-direction: column; }
         .editor-container.horizontal-split .editor-pane { border-right: none; border-bottom: 1px solid #ccc; }

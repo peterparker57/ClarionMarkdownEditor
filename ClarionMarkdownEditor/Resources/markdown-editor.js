@@ -51,6 +51,14 @@
         var isFullscreen = false;
         var isStartPageActive = false;  // Track if Start Page is currently shown
 
+        // View preferences, seeded from C# (SettingsService) via applyViewPreferences.
+        // defaultExpanded  → new file tabs open expanded (rendered-only) vs split
+        // splitRatio       → editor pane's fraction of the split (0.15–0.85)
+        // defaultHorizontal→ panes stacked (top/bottom) vs side-by-side
+        var defaultExpanded = false;
+        var splitRatio = 0.5;
+        var defaultHorizontal = false;
+
         // ====================================
         // Tab Management System
         // ====================================
@@ -96,7 +104,9 @@
                 fileName: fileName || 'Untitled',
                 isReadOnly: readOnly,
                 baseUrl: baseUrl || '',
-                isFullscreen: readOnly
+                // URL/read-only tabs always open expanded (they're for reading);
+                // file tabs follow the remembered Expand/Split preference.
+                isFullscreen: readOnly || defaultExpanded
             };
 
             // Create tab element
@@ -446,6 +456,24 @@
         function notifyDocumentClicked() {
             if (window.chrome && window.chrome.webview) {
                 window.chrome.webview.postMessage({ type: 'documentClicked', data: {} });
+            }
+        }
+
+        function notifyViewModeChanged(expanded) {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({ type: 'viewModeChanged', data: { expanded: expanded } });
+            }
+        }
+
+        function notifySplitRatioChanged(ratio) {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({ type: 'splitRatioChanged', data: { ratio: ratio } });
+            }
+        }
+
+        function notifySplitDirectionChanged(horizontal) {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({ type: 'splitDirectionChanged', data: { horizontal: horizontal } });
             }
         }
 
@@ -941,24 +969,110 @@
             if (activeTabId && tabs[activeTabId]) {
                 tabs[activeTabId].isFullscreen = isFullscreen;
             }
+            // Remember this as the default for newly-opened file tabs, and
+            // persist it across sessions (issue #11 — "remember last preference").
+            defaultExpanded = isFullscreen;
+            notifyViewModeChanged(isFullscreen);
         }
 
         var isHorizontalSplit = false;
-        function toggleSplitDirection() {
-            isHorizontalSplit = !isHorizontalSplit;
+
+        function applySplitDirection(horizontal) {
+            isHorizontalSplit = !!horizontal;
             var editorContainer = document.querySelector('.editor-container');
             var splitBtn = document.getElementById('splitBtn');
 
             if (isHorizontalSplit) {
                 editorContainer.classList.add('horizontal-split');
-                splitBtn.textContent = '⬍ Horizontal';
-                splitBtn.title = 'Switch to vertical split (side by side)';
+                if (splitBtn) {
+                    splitBtn.textContent = '⬍ Horizontal';
+                    splitBtn.title = 'Switch to vertical split (side by side)';
+                }
             } else {
                 editorContainer.classList.remove('horizontal-split');
-                splitBtn.textContent = '⬌ Vertical';
-                splitBtn.title = 'Switch to horizontal split (stacked)';
+                if (splitBtn) {
+                    splitBtn.textContent = '⬌ Vertical';
+                    splitBtn.title = 'Switch to horizontal split (stacked)';
+                }
             }
+            applySplitRatio();
         }
+
+        function toggleSplitDirection() {
+            applySplitDirection(!isHorizontalSplit);
+            defaultHorizontal = isHorizontalSplit;
+            notifySplitDirectionChanged(isHorizontalSplit);
+        }
+
+        // Apply the current split ratio to the editor pane. flex-basis follows the
+        // container's main axis, so the same fraction works for both side-by-side
+        // (width) and stacked (height) layouts. The preview pane keeps flex:1 and
+        // fills whatever's left.
+        function applySplitRatio() {
+            if (!editorPane) return;
+            var pct = Math.max(0.15, Math.min(0.85, splitRatio)) * 100;
+            editorPane.style.flex = '0 0 ' + pct + '%';
+        }
+
+        // Seed view preferences from C# (SettingsService). Called once after the
+        // page loads, before any file tab is opened.
+        function applyViewPreferences(expanded, ratio, horizontal) {
+            defaultExpanded = !!expanded;
+            if (typeof ratio === 'number' && !isNaN(ratio)) {
+                splitRatio = Math.max(0.15, Math.min(0.85, ratio));
+            }
+            defaultHorizontal = !!horizontal;
+            applySplitDirection(defaultHorizontal); // also applies the ratio
+        }
+
+        // --- Splitter drag handling ---
+        (function initSplitter() {
+            var splitter = document.getElementById('paneSplitter');
+            if (!splitter) return;
+            var container = document.querySelector('.editor-container');
+            var dragging = false;
+
+            function onMouseMove(e) {
+                if (!dragging) return;
+                var rect = container.getBoundingClientRect();
+                var ratio = isHorizontalSplit
+                    ? (e.clientY - rect.top) / rect.height
+                    : (e.clientX - rect.left) / rect.width;
+                if (isNaN(ratio)) return;
+                splitRatio = Math.max(0.15, Math.min(0.85, ratio));
+                applySplitRatio();
+                e.preventDefault();
+            }
+
+            function onMouseUp() {
+                if (!dragging) return;
+                dragging = false;
+                splitter.classList.remove('dragging');
+                container.classList.remove('resizing');
+                document.removeEventListener('mousemove', onMouseMove);
+                document.removeEventListener('mouseup', onMouseUp);
+                // Persist the new ratio across sessions.
+                notifySplitRatioChanged(splitRatio);
+            }
+
+            splitter.addEventListener('mousedown', function (e) {
+                // Don't start a drag while the editor pane is collapsed (fullscreen).
+                if (isFullscreen) return;
+                dragging = true;
+                splitter.classList.add('dragging');
+                container.classList.add('resizing');
+                document.addEventListener('mousemove', onMouseMove);
+                document.addEventListener('mouseup', onMouseUp);
+                e.preventDefault();
+            });
+
+            // Double-click resets to a 50/50 split.
+            splitter.addEventListener('dblclick', function () {
+                splitRatio = 0.5;
+                applySplitRatio();
+                notifySplitRatioChanged(splitRatio);
+            });
+        })();
 
         function isAbsoluteUrl(u) {
             if (!u) return false;
