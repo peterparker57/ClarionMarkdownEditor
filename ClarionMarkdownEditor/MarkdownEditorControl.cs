@@ -224,6 +224,18 @@ namespace ClarionMarkdownEditor
                             _isDarkMode = _settingsService.Get("DarkMode") == "true";
                             if (_isDarkMode)
                                 await webView.ExecuteScriptAsync("setDarkMode(true)");
+
+                            // Restore view preferences: Expand/Split, split ratio, split direction.
+                            var expandedPref = _settingsService.Get("DefaultExpanded") == "true" ? "true" : "false";
+                            var horizontalPref = _settingsService.Get("HorizontalSplit") == "true" ? "true" : "false";
+                            double ratioVal;
+                            if (!double.TryParse(_settingsService.Get("SplitRatio"),
+                                    System.Globalization.NumberStyles.Float,
+                                    System.Globalization.CultureInfo.InvariantCulture, out ratioVal))
+                                ratioVal = 0.5;
+                            var ratioArg = ratioVal.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                            await webView.ExecuteScriptAsync(
+                                $"applyViewPreferences({expandedPref}, {ratioArg}, {horizontalPref})");
                             if (!string.IsNullOrEmpty(_pendingFilePath))
                             {
                                 var path = _pendingFilePath;
@@ -1562,6 +1574,32 @@ namespace ClarionMarkdownEditor
                             var isDarkStr = ExtractJsonValue(message, "isDark");
                             _isDarkMode = isDarkStr?.ToLower() == "true";
                             _settingsService.Set("DarkMode", _isDarkMode ? "true" : "false");
+                        }
+                        break;
+
+                    case "viewModeChanged":
+                        {
+                            // User toggled Expand/Split — remember it as the default for new file tabs.
+                            var expanded = ExtractNestedJsonValue(message, "data", "expanded");
+                            _settingsService.Set("DefaultExpanded",
+                                expanded?.ToLower() == "true" ? "true" : "false");
+                        }
+                        break;
+
+                    case "splitRatioChanged":
+                        {
+                            // User dragged the splitter — persist the editor pane's fraction.
+                            var ratio = ExtractNestedJsonValue(message, "data", "ratio");
+                            if (!string.IsNullOrEmpty(ratio))
+                                _settingsService.Set("SplitRatio", ratio);
+                        }
+                        break;
+
+                    case "splitDirectionChanged":
+                        {
+                            var horizontal = ExtractNestedJsonValue(message, "data", "horizontal");
+                            _settingsService.Set("HorizontalSplit",
+                                horizontal?.ToLower() == "true" ? "true" : "false");
                         }
                         break;
 

@@ -10,7 +10,7 @@ Contributors:
 
 --- 
 
-## v1.3.0 — 2026-08-10 — Auto-refresh open tabs when files change on disk
+## v1.3.0 — 2026-08-10 — Auto-refresh, remembered view preferences, and resizable panes
 
 ### Added
 - **Auto-refresh on external file changes** ([#11](https://github.com/msarson/ClarionMarkdownEditor/issues/11), reported by Kevin Erskine). Open tabs now track their backing file on disk and update themselves when the file is changed by something outside the editor (CA/Claude editing a Markdown file you're viewing, or the same file open in VS Code). No more stale views and no manual reload needed for the common case.
@@ -19,6 +19,8 @@ Contributors:
   - **Tabs with unsaved edits are never clobbered.** Instead a passive **↻ "changed on disk"** badge appears on the tab; clicking it (or **Reload from Disk** in the tab context menu) prompts before discarding your changes. Deleted/renamed files flag the tab the same way and keep the in-editor buffer intact.
   - Each tab carries a `DiskContent` baseline so the editor's *own* saves (and no-op touches) are recognized and ignored — the watcher only reacts to genuine external changes.
 - **"Reload from Disk"** tab context-menu item and badge-click action, both routed through a single `ReloadTabFromDisk` path that confirms before overwriting unsaved edits.
+- **Remembered Expand/Split preference** ([#11](https://github.com/msarson/ClarionMarkdownEditor/issues/11), requested by Kevin Erskine). New file tabs now open in your last-used view mode instead of always starting split, so a view-only user no longer has to click **Expand** every time. Toggling Expand/Split updates the remembered default, which is persisted across sessions via `SettingsService` (`DefaultExpanded`). URL/read-only tabs still open expanded since they're for reading.
+- **Resizable editor / preview panes.** A draggable splitter between the two panes lets you set the split to taste; it works both side-by-side and in the stacked (horizontal) split, is clamped to 15–85% so neither pane can vanish, and hides itself in Expanded (single-pane) view. **Double-click** the splitter to reset to 50/50. The split ratio (`SplitRatio`) and split direction (`HorizontalSplit`) are persisted across sessions.
 
 ### Notes
 - The in-place reload preserves **scroll**, not the caret, because the editor is a plain `<textarea>` (a character offset can't track its logical line when text shifts above it). True VS-Code-style caret + view tracking is deferred to the CodeMirror 6 migration ([#10](https://github.com/msarson/ClarionMarkdownEditor/issues/10)), where reload can be dispatched as a mapped change transaction.
