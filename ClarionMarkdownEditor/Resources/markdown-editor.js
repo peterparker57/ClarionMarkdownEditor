@@ -1,0 +1,1421 @@
+        // Initialize Mermaid
+        if (typeof mermaid !== 'undefined') {
+            mermaid.initialize({ 
+                startOnLoad: false, 
+                theme: 'default',  // 'default' is more colorful than 'dark'
+                themeVariables: {
+                    primaryColor: '#4a90e2',
+                    primaryTextColor: '#fff',
+                    primaryBorderColor: '#2e5c8a',
+                    lineColor: '#6c757d',
+                    secondaryColor: '#82ca9d',
+                    tertiaryColor: '#ffc658'
+                },
+                securityLevel: 'loose'
+            });
+        }
+
+        // Configure marked@11 (loaded from the bundled marked.min.js).
+        // - gfm: enable GitHub-flavored extensions (tables, task lists, strikethrough, autolinks)
+        // - breaks: false — CommonMark behavior; a lone newline is whitespace, not <br>
+        // - code renderer override: map ```mermaid fences to <div class="mermaid">…</div>
+        //   so the existing mermaid.run() post-processing in updatePreview() keeps working
+        //   unchanged. marked@11 calls renderer.code(text, lang, escaped) positionally
+        //   (verified in marked.min.js source — not the token-object form some docs imply).
+        //   Returning false from any other branch falls through to marked's default
+        //   <pre><code class="language-…"> output that highlight.js then picks up.
+        if (typeof marked !== 'undefined') {
+            marked.use({
+                gfm: true,
+                breaks: false,
+                renderer: {
+                    code: function(code, lang) {
+                        if (lang === 'mermaid') {
+                            return '<div class="mermaid">' + escapeHtml(code) + '</div>\n';
+                        }
+                        return false;
+                    }
+                }
+            });
+        }
+
+        var editor = document.getElementById('editor');
+        var preview = document.getElementById('preview');
+        var statusEl = document.getElementById('status');
+        var statsEl = document.getElementById('stats');
+        var editorPane = document.querySelector('.editor-pane');
+        var previewPane = document.getElementById('previewPane');
+        var toggleBtn = document.getElementById('toggleBtn');
+        var formatToolbar = document.querySelector('.format-toolbar');
+        var isDirty = false;
+        var isFullscreen = false;
+        var isStartPageActive = false;  // Track if Start Page is currently shown
+
+        // View preferences, seeded from C# (SettingsService) via applyViewPreferences.
+        // defaultExpanded  → new file tabs open expanded (rendered-only) vs split
+        // splitRatio       → editor pane's fraction of the split (0.15–0.85)
+        // defaultHorizontal→ panes stacked (top/bottom) vs side-by-side
+        var defaultExpanded = false;
+        var splitRatio = 0.5;
+        var defaultHorizontal = false;
+
+        // ====================================
+        // Tab Management System
+        // ====================================
+        var tabs = {};  // { tabId: { content, isDirty, filePath, fileName } }
+        var activeTabId = null;
+        var contextMenuTabId = null;
+        var tabBar = document.getElementById('tabBar');
+        var tabContextMenu = document.getElementById('tabContextMenu');
+
+        // Find tab by file path
+        function findTabByFilePath(filePath) {
+            for (var id in tabs) {
+                if (tabs[id].filePath === filePath) {
+                    return id;
+                }
+            }
+            return null;
+        }
+
+        // Add a new tab or switch to existing one with same file path
+        function addTab(tabId, fileName, content, filePath, isReadOnly, baseUrl) {
+            // Check if a tab with this file path already exists
+            var existingTabId = findTabByFilePath(filePath);
+            if (existingTabId) {
+                switchTab(existingTabId);
+                return existingTabId;
+            }
+
+            // Save current tab content before adding new one
+            if (activeTabId && tabs[activeTabId]) {
+                tabs[activeTabId].content = editor.value;
+            }
+
+            var readOnly = isReadOnly === true;
+
+            // Create tab data. URL/read-only tabs default to expanded
+            // (rendered-only) view since they're meant for reading.
+            tabs[tabId] = {
+                content: content || '',
+                cleanContent: content || '',
+                isDirty: false,
+                filePath: filePath || '',
+                fileName: fileName || 'Untitled',
+                isReadOnly: readOnly,
+                baseUrl: baseUrl || '',
+                // URL/read-only tabs always open expanded (they're for reading);
+                // file tabs follow the remembered Expand/Split preference.
+                isFullscreen: readOnly || defaultExpanded
+            };
+
+            // Create tab element
+            var tabEl = document.createElement('div');
+            tabEl.className = 'tab' + (readOnly ? ' tab-readonly' : '');
+            tabEl.setAttribute('data-tab-id', tabId);
+            var lockBadge = readOnly
+                ? '<span class="tab-lock" title="Read-only (from URL)">🔒</span>'
+                : '';
+            tabEl.innerHTML = '<span class="tab-dirty" style="display:none;">*</span>' +
+                              lockBadge +
+                              '<span class="tab-title">' + escapeHtml(fileName) + '</span>' +
+                              '<span class="tab-close" title="Close">&times;</span>';
+
+            // Tab click handler
+            tabEl.addEventListener('click', function(e) {
+                if (e.target.classList.contains('tab-close')) {
+                    // Close button clicked
+                    e.stopPropagation();
+                    notifyCloseTabRequested(tabId);
+                } else {
+                    switchTab(tabId);
+                }
+            });
+
+            // Right-click context menu
+            tabEl.addEventListener('contextmenu', function(e) {
+                e.preventDefault();
+                showTabContextMenu(tabId, e.clientX, e.clientY);
+            });
+
+            tabBar.appendChild(tabEl);
+
+            // Switch to the new tab
+            switchTab(tabId);
+
+            return tabId;
+        }
+
+        // Switch to a specific tab
+        function switchTab(tabId) {
+            // Handle Start Page tab specially
+            if (tabId === 'startPage') {
+                switchToStartPage();
+                return;
+            }
+
+            // If switching away from Start Page, hide it
+            if (isStartPageActive) {
+                hideStartPage();
+            }
+
+            if (!tabs[tabId]) return;
+
+            // Save current tab content before switching
+            if (activeTabId && tabs[activeTabId] && activeTabId !== tabId && !tabs[activeTabId].isStartPage) {
+                tabs[activeTabId].content = editor.value;
+            }
+
+            // Update active tab visually
+            var allTabs = tabBar.querySelectorAll('.tab');
+            allTabs.forEach(function(tab) {
+                tab.classList.remove('active');
+            });
+            var newActiveTab = tabBar.querySelector('[data-tab-id="' + tabId + '"]');
+            if (newActiveTab) {
+                newActiveTab.classList.add('active');
+                // Scroll tab into view if needed
+                newActiveTab.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
+            }
+
+            // Load the tab's content
+            activeTabId = tabId;
+            editor.value = tabs[tabId].content;
+            isDirty = tabs[tabId].isDirty;
+            editor.readOnly = tabs[tabId].isReadOnly === true;
+
+            // Apply the tab's saved expanded/split preference. Falsy → false
+            // so old tabs without the field stay in split view.
+            applyFullscreen(tabs[tabId].isFullscreen === true);
+
+            updatePreview();
+
+            // Notify C#
+            notifyTabSwitched(tabId);
+        }
+
+        // Close a tab
+        function closeTab(tabId) {
+            if (!tabs[tabId]) return;
+
+            // Don't allow closing the Start Page
+            if (tabId === 'startPage') return;
+
+            // Remove tab element
+            var tabEl = tabBar.querySelector('[data-tab-id="' + tabId + '"]');
+            if (tabEl) {
+                tabEl.remove();
+            }
+
+            // Remove tab data
+            delete tabs[tabId];
+
+            // If closing the active tab, switch to another
+            if (activeTabId === tabId) {
+                // Get remaining tabs excluding Start Page
+                var remainingTabIds = Object.keys(tabs).filter(function(id) {
+                    return id !== 'startPage';
+                });
+                if (remainingTabIds.length > 0) {
+                    switchTab(remainingTabIds[remainingTabIds.length - 1]);
+                } else {
+                    // No more file tabs - switch to Start Page
+                    switchToStartPage();
+                }
+            }
+        }
+
+        // Update dirty indicator for a tab
+        function updateTabDirty(tabId, dirty) {
+            if (!tabs[tabId]) return;
+            tabs[tabId].isDirty = dirty;
+
+            var tabEl = tabBar.querySelector('[data-tab-id="' + tabId + '"]');
+            if (tabEl) {
+                var dirtyIndicator = tabEl.querySelector('.tab-dirty');
+                if (dirtyIndicator) {
+                    dirtyIndicator.style.display = dirty ? 'inline' : 'none';
+                }
+            }
+
+            // Update global isDirty if this is active tab
+            if (tabId === activeTabId) {
+                isDirty = dirty;
+            }
+        }
+
+        // Alias for C# compatibility
+        function setTabDirty(tabId, dirty) {
+            if (!dirty && tabs[tabId]) {
+                // Clearing dirty after save — update the clean baseline
+                var savedContent = (tabId === activeTabId) ? editor.value : tabs[tabId].content;
+                tabs[tabId].cleanContent = savedContent;
+            }
+            updateTabDirty(tabId, dirty);
+        }
+
+        // Replace a tab's content in place from an external (on-disk) change,
+        // preserving scroll for the active tab and clearing dirty + changed-on-disk
+        // state. content already uses \n line endings (normalized in C#).
+        function reloadTabContent(tabId, content) {
+            if (!tabs[tabId]) return;
+            tabs[tabId].content = content;
+            tabs[tabId].cleanContent = content;
+            tabs[tabId].isDirty = false;
+            updateTabDirty(tabId, false);
+            setTabExternallyChanged(tabId, false, false);
+
+            if (tabId === activeTabId) {
+                // Preserve scroll positions across the reload.
+                var edRatio = scrollRatio(editor);
+                var pvRatio = scrollRatio(preview);
+                editor.value = content;
+                updatePreview();
+                requestAnimationFrame(function () {
+                    applyScrollRatio(editor, edRatio);
+                    applyScrollRatio(preview, pvRatio);
+                });
+            }
+        }
+
+        function scrollRatio(el) {
+            if (!el) return 0;
+            var denom = el.scrollHeight - el.clientHeight;
+            if (denom <= 0) return 0;
+            var r = el.scrollTop / denom;
+            return isNaN(r) ? 0 : r;
+        }
+
+        function applyScrollRatio(el, ratio) {
+            if (!el) return;
+            var denom = el.scrollHeight - el.clientHeight;
+            if (denom > 0) el.scrollTop = ratio * denom;
+        }
+
+        // Show/hide a "changed on disk" badge on a tab. deleted=true tweaks the
+        // tooltip. Clicking the badge asks C# to reload the tab from disk.
+        function setTabExternallyChanged(tabId, changed, deleted) {
+            if (!tabs[tabId]) return;
+            tabs[tabId].externallyChanged = !!changed;
+
+            var tabEl = tabBar.querySelector('[data-tab-id="' + tabId + '"]');
+            if (!tabEl) return;
+
+            var badge = tabEl.querySelector('.tab-changed');
+            if (changed) {
+                if (!badge) {
+                    badge = document.createElement('span');
+                    badge.className = 'tab-changed';
+                    badge.textContent = '↻'; // ↻
+                    badge.addEventListener('click', function (e) {
+                        e.stopPropagation();
+                        notifyReloadRequested(tabId);
+                    });
+                    // Place it just before the close button.
+                    var closeEl = tabEl.querySelector('.tab-close');
+                    if (closeEl) tabEl.insertBefore(badge, closeEl);
+                    else tabEl.appendChild(badge);
+                }
+                badge.title = deleted
+                    ? 'File was deleted on disk — click to reload'
+                    : 'File changed on disk — click to reload';
+                badge.style.display = 'inline';
+            } else if (badge) {
+                badge.remove();
+            }
+        }
+
+        function notifyReloadRequested(tabId) {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({ type: 'reloadRequested', data: { tabId: tabId } });
+            }
+        }
+
+        // Get content of the active tab
+        function getActiveTabContent() {
+            if (activeTabId && tabs[activeTabId]) {
+                // Return current editor value (which is the active tab's content)
+                return editor.value();
+            }
+            return '';
+        }
+
+        // Get active tab ID
+        function getActiveTabId() {
+            return activeTabId;
+        }
+
+        // Get tab info
+        function getTabInfo(tabId) {
+            return tabs[tabId] || null;
+        }
+
+        // Get content of a specific tab
+        function getTabContent(tabId) {
+            if (tabId === activeTabId) {
+                // For active tab, return current editor value
+                return editor.value();
+            }
+            if (tabs[tabId]) {
+                return tabs[tabId].content;
+            }
+            return '';
+        }
+
+        // Show tab context menu
+        function showTabContextMenu(tabId, x, y) {
+            contextMenuTabId = tabId;
+            tabContextMenu.style.left = x + 'px';
+            tabContextMenu.style.top = y + 'px';
+            tabContextMenu.classList.add('visible');
+        }
+
+        // Hide tab context menu
+        function hideTabContextMenu() {
+            tabContextMenu.classList.remove('visible');
+            contextMenuTabId = null;
+        }
+
+        // Handle context menu item click
+        function handleContextMenuAction(action) {
+            if (!contextMenuTabId) return;
+
+            var tabId = contextMenuTabId;
+            hideTabContextMenu();
+
+            switch (action) {
+                case 'close':
+                    notifyCloseTabRequested(tabId);
+                    break;
+                case 'closeOthers':
+                    notifyContextMenuAction('CloseOthers', tabId);
+                    break;
+                case 'closeAll':
+                    notifyContextMenuAction('CloseAll', tabId);
+                    break;
+                case 'save':
+                    notifyContextMenuAction('Save', tabId);
+                    break;
+                case 'saveAs':
+                    notifyContextMenuAction('SaveAs', tabId);
+                    break;
+                case 'reloadFromDisk':
+                    notifyContextMenuAction('Reload', tabId);
+                    break;
+                case 'copyPath':
+                    notifyContextMenuAction('CopyPath', tabId);
+                    break;
+                case 'openFolder':
+                    notifyContextMenuAction('OpenContainingFolder', tabId);
+                    break;
+            }
+        }
+
+        // Context menu click handler
+        tabContextMenu.addEventListener('click', function(e) {
+            var action = e.target.getAttribute('data-action');
+            if (action) {
+                handleContextMenuAction(action);
+            }
+        });
+
+        // Hide context menu when clicking elsewhere and notify C# to close menu dropdowns
+        document.addEventListener('click', function(e) {
+            if (!tabContextMenu.contains(e.target)) {
+                hideTabContextMenu();
+            }
+            notifyDocumentClicked();
+        });
+
+        // Hide context menu on escape key
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') {
+                hideTabContextMenu();
+            }
+        });
+
+        // C# notification helpers
+        function notifyTabSwitched(tabId) {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({ type: 'tabSwitched', data: { tabId: tabId } });
+            }
+        }
+
+        function notifyCloseTabRequested(tabId) {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({ type: 'closeTabRequested', data: { tabId: tabId } });
+            }
+        }
+
+        function notifyContextMenuAction(action, tabId) {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({ type: 'contextMenuAction', data: { action: action, tabId: tabId } });
+            }
+        }
+
+        function notifyDocumentClicked() {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({ type: 'documentClicked', data: {} });
+            }
+        }
+
+        function notifyViewModeChanged(expanded) {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({ type: 'viewModeChanged', data: { expanded: expanded } });
+            }
+        }
+
+        function notifySplitRatioChanged(ratio) {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({ type: 'splitRatioChanged', data: { ratio: ratio } });
+            }
+        }
+
+        function notifySplitDirectionChanged(horizontal) {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({ type: 'splitDirectionChanged', data: { horizontal: horizontal } });
+            }
+        }
+
+        // About dialog functions
+        function showAboutDialog() {
+            document.getElementById('aboutModal').classList.add('visible');
+        }
+
+        function hideAboutDialog() {
+            document.getElementById('aboutModal').classList.remove('visible');
+        }
+
+        // Close about dialog when clicking overlay or pressing Escape
+        var aboutModalEl = document.getElementById('aboutModal');
+        if (aboutModalEl) {
+            aboutModalEl.addEventListener('click', function(e) {
+                if (e.target === this) {
+                    hideAboutDialog();
+                }
+            });
+        }
+
+        document.addEventListener('keydown', function(e) {
+            var modal = document.getElementById('aboutModal');
+            if (e.key === 'Escape' && modal && modal.classList.contains('visible')) {
+                hideAboutDialog();
+            }
+        });
+
+        // HTML escape helper
+        function escapeHtml(text) {
+            var div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        // Update tab content without marking as dirty (for loading/saving)
+        function setTabContent(tabId, content) {
+            if (!tabs[tabId]) return;
+            tabs[tabId].content = content;
+            if (tabId === activeTabId) {
+                editor.value = content;
+                // Update preview without triggering dirty
+                preview.innerHTML = marked.parse(content);
+                if (typeof hljs !== 'undefined') {
+                    // Only highlight blocks with an explicit language class — skip hljs auto-detection on no-language fences
+                var blocks = preview.querySelectorAll('pre code[class*="language-"]');
+                    blocks.forEach(function(block) {
+                        block.removeAttribute('data-highlighted');
+                        try { hljs.highlightElement(block); } catch (err) {}
+                    });
+                }
+                if (typeof mermaid !== 'undefined') {
+                    var mermaidDivs = preview.querySelectorAll('.mermaid');
+                    if (mermaidDivs.length > 0) {
+                        requestAnimationFrame(function() {
+                            try { mermaid.run({ nodes: mermaidDivs }); } catch (err) {}
+                        });
+                    }
+                }
+                updateStats();
+            }
+        }
+
+        // Get all tabs info (for C# to query state)
+        function getAllTabs() {
+            var result = [];
+            for (var id in tabs) {
+                result.push({
+                    tabId: id,
+                    fileName: tabs[id].fileName,
+                    filePath: tabs[id].filePath,
+                    isDirty: tabs[id].isDirty
+                });
+            }
+            return result;
+        }
+
+        // Update tab file info (e.g., after Save As). When isReadOnly is passed
+        // (true/false), also update the tab's read-only state and visual badge.
+        function updateTabInfo(tabId, fileName, filePath, isReadOnly) {
+            if (!tabs[tabId]) return;
+            tabs[tabId].fileName = fileName;
+            tabs[tabId].filePath = filePath;
+
+            var tabEl = tabBar.querySelector('[data-tab-id="' + tabId + '"]');
+            if (tabEl) {
+                var titleEl = tabEl.querySelector('.tab-title');
+                if (titleEl) {
+                    titleEl.textContent = fileName;
+                }
+            }
+
+            if (typeof isReadOnly === 'boolean') {
+                tabs[tabId].isReadOnly = isReadOnly;
+                if (tabEl) {
+                    if (isReadOnly) {
+                        tabEl.classList.add('tab-readonly');
+                        if (!tabEl.querySelector('.tab-lock')) {
+                            var lock = document.createElement('span');
+                            lock.className = 'tab-lock';
+                            lock.title = 'Read-only (from URL)';
+                            lock.textContent = '🔒';
+                            tabEl.insertBefore(lock, tabEl.querySelector('.tab-title'));
+                        }
+                    } else {
+                        tabEl.classList.remove('tab-readonly');
+                        var existingLock = tabEl.querySelector('.tab-lock');
+                        if (existingLock) existingLock.remove();
+                    }
+                }
+                if (tabId === activeTabId) {
+                    editor.readOnly = isReadOnly;
+                    // Promoting URL → editable: leave reading mode so the
+                    // user can actually see what they're editing.
+                    if (!isReadOnly && tabs[tabId].isFullscreen) {
+                        tabs[tabId].isFullscreen = false;
+                        applyFullscreen(false);
+                    } else {
+                        applyFormatToolbarVisibility();
+                    }
+                }
+            }
+        }
+
+        // Expose tab functions to window for C# access
+        window.addTab = addTab;
+        window.switchTab = switchTab;
+        window.switchToTab = switchTab;  // Alias for C# compatibility
+        window.closeTab = closeTab;
+        window.removeTab = closeTab;     // Alias for C# compatibility
+        window.setTabDirty = setTabDirty;
+        window.updateTabDirty = updateTabDirty;
+        window.getActiveTabContent = getActiveTabContent;
+        window.getActiveTabId = getActiveTabId;
+        window.getTabInfo = getTabInfo;
+        window.getTabContent = getTabContent;
+        window.setTabContent = setTabContent;
+        window.getAllTabs = getAllTabs;
+        window.updateTabInfo = updateTabInfo;
+        window.updateTab = updateTabInfo; // Alias for C# compatibility
+
+        // ====================================
+        // End Tab Management System
+        // ====================================
+
+        // ====================================
+        // Start Page System
+        // ====================================
+
+        function initStartPage() {
+            // Called after page load - nothing needed currently
+        }
+
+        function showStartPage() {
+            var startPageEl = document.getElementById('startPage');
+            var editorContainer = document.querySelector('.editor-container');
+
+            if (startPageEl && editorContainer) {
+                startPageEl.style.display = 'flex';
+                editorContainer.style.display = 'none';
+                isStartPageActive = true;
+                applyFormatToolbarVisibility();
+            }
+        }
+
+        function hideStartPage() {
+            var startPageEl = document.getElementById('startPage');
+            var editorContainer = document.querySelector('.editor-container');
+
+            if (startPageEl && editorContainer) {
+                startPageEl.style.display = 'none';
+                editorContainer.style.display = 'flex';
+                isStartPageActive = false;
+                applyFormatToolbarVisibility();
+            }
+        }
+
+        function addStartPageTab() {
+            // Check if Start Page tab already exists
+            if (tabs['startPage']) {
+                switchToStartPage();
+                return;
+            }
+
+            // Create Start Page tab data
+            tabs['startPage'] = {
+                content: '',
+                isDirty: false,
+                filePath: '',
+                fileName: 'Start Page',
+                isStartPage: true
+            };
+
+            // Create tab element (no close button - Start Page cannot be closed)
+            var tabEl = document.createElement('div');
+            tabEl.className = 'tab';
+            tabEl.setAttribute('data-tab-id', 'startPage');
+            tabEl.innerHTML = '<span class="tab-title">Start Page</span>';
+
+            // Tab click handler
+            tabEl.addEventListener('click', function(e) {
+                switchToStartPage();
+            });
+
+            // Insert at beginning of tab bar
+            var tabBarEl = document.getElementById('tabBar');
+            if (tabBarEl.firstChild) {
+                tabBarEl.insertBefore(tabEl, tabBarEl.firstChild);
+            } else {
+                tabBarEl.appendChild(tabEl);
+            }
+
+            switchToStartPage();
+        }
+
+        function switchToStartPage() {
+            // Save current tab content before switching
+            if (activeTabId && tabs[activeTabId] && !tabs[activeTabId].isStartPage) {
+                tabs[activeTabId].content = editor.value;
+            }
+
+            // Update active tab visually
+            var tabBarEl = document.getElementById('tabBar');
+            var allTabs = tabBarEl.querySelectorAll('.tab');
+            allTabs.forEach(function(tab) {
+                tab.classList.remove('active');
+            });
+            var startPageTab = tabBarEl.querySelector('[data-tab-id="startPage"]');
+            if (startPageTab) {
+                startPageTab.classList.add('active');
+                startPageTab.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
+            }
+
+            activeTabId = 'startPage';
+            showStartPage();
+        }
+
+        function populateRecentFiles(recentFiles) {
+            var listEl = document.getElementById('recentFilesList');
+            var emptyEl = document.getElementById('recentEmpty');
+
+            if (!listEl) return;
+
+            listEl.innerHTML = '';
+
+            if (!recentFiles || recentFiles.length === 0) {
+                listEl.style.display = 'none';
+                if (emptyEl) emptyEl.style.display = 'block';
+                return;
+            }
+
+            listEl.style.display = 'flex';
+            if (emptyEl) emptyEl.style.display = 'none';
+
+            recentFiles.forEach(function(file, index) {
+                var itemEl = document.createElement('div');
+                itemEl.className = 'recent-file-item';
+                itemEl.setAttribute('data-file-path', file.path);
+
+                var existsClass = file.exists ? '' : ' style="opacity: 0.5;"';
+
+                itemEl.innerHTML =
+                    '<div class="recent-file-info"' + existsClass + '>' +
+                        '<div class="recent-file-name">' + escapeHtml(file.name) + '</div>' +
+                        '<div class="recent-file-path">' + escapeHtml(file.path) + '</div>' +
+                    '</div>' +
+                    '<div class="recent-file-date">' + escapeHtml(file.modifiedDate || '') + '</div>' +
+                    '<button class="recent-file-remove" title="Remove from list">&times;</button>';
+
+                // Click to open file
+                itemEl.addEventListener('click', function(e) {
+                    if (!e.target.classList.contains('recent-file-remove')) {
+                        startPageOpenRecentFile(file.path);
+                    }
+                });
+
+                // Remove button click
+                var removeBtn = itemEl.querySelector('.recent-file-remove');
+                removeBtn.addEventListener('click', function(e) {
+                    e.stopPropagation();
+                    startPageRemoveRecentFile(index);
+                });
+
+                listEl.appendChild(itemEl);
+            });
+        }
+
+        // Start Page action handlers
+        function startPageNewFile() {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({ type: 'startPageAction', data: { action: 'newFile' } });
+            }
+        }
+
+        function startPageOpenFile() {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({ type: 'startPageAction', data: { action: 'openFile' } });
+            }
+        }
+
+        function dbg(message) {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({ type: 'debugLog', message: String(message) });
+            }
+            console.log('[MarkdownEditor] ' + message);
+        }
+
+        function startPageOpenRecentFile(filePath) {
+            dbg('startPageOpenRecentFile called: ' + filePath);
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({
+                    type: 'startPageAction',
+                    data: { action: 'openRecentFile', filePath: filePath }
+                });
+            }
+        }
+
+        function startPageRemoveRecentFile(index) {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({
+                    type: 'startPageAction',
+                    data: { action: 'removeRecentFile', index: index.toString() }
+                });
+            }
+        }
+
+        function startPageRemoveMissingFiles() {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({
+                    type: 'startPageAction',
+                    data: { action: 'removeMissingFiles' }
+                });
+            }
+        }
+
+        function startPageOpenUrl() {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({ type: 'startPageAction', data: { action: 'openUrl' } });
+            }
+        }
+
+        function startPageOpenRecentUrl(url) {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({
+                    type: 'startPageAction',
+                    data: { action: 'openRecentUrl', url: url }
+                });
+            }
+        }
+
+        function startPageRemoveRecentUrl(index) {
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({
+                    type: 'startPageAction',
+                    data: { action: 'removeRecentUrl', index: index.toString() }
+                });
+            }
+        }
+
+        function populateRecentUrls(recentUrls) {
+            var listEl = document.getElementById('recentUrlsList');
+            var emptyEl = document.getElementById('recentUrlsEmpty');
+            if (!listEl) return;
+
+            listEl.innerHTML = '';
+
+            if (!recentUrls || recentUrls.length === 0) {
+                listEl.style.display = 'none';
+                if (emptyEl) emptyEl.style.display = 'block';
+                return;
+            }
+
+            listEl.style.display = 'flex';
+            if (emptyEl) emptyEl.style.display = 'none';
+
+            recentUrls.forEach(function(item, index) {
+                var itemEl = document.createElement('div');
+                itemEl.className = 'recent-file-item';
+                itemEl.setAttribute('data-url', item.url);
+
+                itemEl.innerHTML =
+                    '<div class="recent-file-info">' +
+                        '<div class="recent-file-name">' + escapeHtml(item.name || item.url) + '</div>' +
+                        '<div class="recent-file-path">' + escapeHtml(item.url) + '</div>' +
+                    '</div>' +
+                    '<button class="recent-file-remove" title="Remove from list">&times;</button>';
+
+                itemEl.addEventListener('click', function(e) {
+                    if (!e.target.classList.contains('recent-file-remove')) {
+                        startPageOpenRecentUrl(item.url);
+                    }
+                });
+
+                var removeBtn = itemEl.querySelector('.recent-file-remove');
+                removeBtn.addEventListener('click', function(e) {
+                    e.stopPropagation();
+                    startPageRemoveRecentUrl(index);
+                });
+
+                listEl.appendChild(itemEl);
+            });
+        }
+
+        // Expose Start Page functions to window for C# access
+        window.addStartPageTab = addStartPageTab;
+        window.showStartPage = showStartPage;
+        window.hideStartPage = hideStartPage;
+        window.populateRecentFiles = populateRecentFiles;
+        window.populateRecentUrls = populateRecentUrls;
+        window.switchToStartPage = switchToStartPage;
+        window.initStartPage = initStartPage;
+        // ====================================
+        // End Start Page System
+        // ====================================
+
+        // Debouncing for preview updates to prevent system lockup
+        var updateTimeout = null;
+        var renderGeneration = 0;
+        var DEBOUNCE_MS = 150;
+
+        function debouncedUpdatePreview() {
+            if (updateTimeout) {
+                clearTimeout(updateTimeout);
+            }
+            updateTimeout = setTimeout(function() {
+                updatePreview();
+                // Mark dirty only on actual user edits (not tab switches or loads)
+                if (activeTabId && tabs[activeTabId]) {
+                    var currentContent = editor.value;
+                    var nowDirty = currentContent !== tabs[activeTabId].cleanContent;
+                    var wasDirty = tabs[activeTabId].isDirty;
+                    isDirty = nowDirty;
+                    tabs[activeTabId].isDirty = nowDirty;
+                    var tabEl = tabBar.querySelector('[data-tab-id="' + activeTabId + '"]');
+                    if (tabEl) {
+                        var dirtyIndicator = tabEl.querySelector('.tab-dirty');
+                        if (dirtyIndicator) {
+                            dirtyIndicator.style.display = nowDirty ? 'inline' : 'none';
+                        }
+                    }
+                    // Only notify C# when dirty state changes to avoid spurious IsDirty=true
+                    if (nowDirty !== wasDirty && window.chrome && window.chrome.webview) {
+                        window.chrome.webview.postMessage({
+                            type: 'tabDirtyChanged',
+                            data: { tabId: activeTabId, isDirty: nowDirty }
+                        });
+                    }
+                }
+            }, DEBOUNCE_MS);
+        }
+
+        function applyFullscreen(on) {
+            isFullscreen = !!on;
+            if (isFullscreen) {
+                editorPane.classList.add('hidden');
+                previewPane.classList.add('fullscreen');
+                toggleBtn.textContent = 'Split';
+                toggleBtn.title = 'Show editor and preview side by side';
+            } else {
+                editorPane.classList.remove('hidden');
+                previewPane.classList.remove('fullscreen');
+                toggleBtn.textContent = 'Expand';
+                toggleBtn.title = 'Toggle fullscreen preview';
+            }
+            applyFormatToolbarVisibility();
+        }
+
+        // Format toolbar is hidden when (a) the Start Page is up, (b) the
+        // preview is fullscreen, or (c) the active tab is read-only —
+        // those buttons can't do anything on a locked textarea anyway.
+        // Clears any leftover inline display style so the class-based rule
+        // actually wins (showStartPage / hideStartPage historically used
+        // inline styles that override class declarations).
+        function applyFormatToolbarVisibility() {
+            if (!formatToolbar) return;
+            var activeTab = activeTabId ? tabs[activeTabId] : null;
+            var hide = isStartPageActive ||
+                       isFullscreen ||
+                       (activeTab && activeTab.isReadOnly === true);
+            formatToolbar.style.display = '';
+            if (hide) {
+                formatToolbar.classList.add('hidden');
+            } else {
+                formatToolbar.classList.remove('hidden');
+            }
+        }
+
+        function toggleFullscreen() {
+            applyFullscreen(!isFullscreen);
+            // Persist the user's choice on the active tab so switching away
+            // and back doesn't surprise them.
+            if (activeTabId && tabs[activeTabId]) {
+                tabs[activeTabId].isFullscreen = isFullscreen;
+            }
+            // Remember this as the default for newly-opened file tabs, and
+            // persist it across sessions (issue #11 — "remember last preference").
+            defaultExpanded = isFullscreen;
+            notifyViewModeChanged(isFullscreen);
+        }
+
+        var isHorizontalSplit = false;
+
+        function applySplitDirection(horizontal) {
+            isHorizontalSplit = !!horizontal;
+            var editorContainer = document.querySelector('.editor-container');
+            var splitBtn = document.getElementById('splitBtn');
+
+            if (isHorizontalSplit) {
+                editorContainer.classList.add('horizontal-split');
+                if (splitBtn) {
+                    splitBtn.textContent = '⬍ Horizontal';
+                    splitBtn.title = 'Switch to vertical split (side by side)';
+                }
+            } else {
+                editorContainer.classList.remove('horizontal-split');
+                if (splitBtn) {
+                    splitBtn.textContent = '⬌ Vertical';
+                    splitBtn.title = 'Switch to horizontal split (stacked)';
+                }
+            }
+            applySplitRatio();
+        }
+
+        function toggleSplitDirection() {
+            applySplitDirection(!isHorizontalSplit);
+            defaultHorizontal = isHorizontalSplit;
+            notifySplitDirectionChanged(isHorizontalSplit);
+        }
+
+        // Apply the current split ratio to the editor pane. flex-basis follows the
+        // container's main axis, so the same fraction works for both side-by-side
+        // (width) and stacked (height) layouts. The preview pane keeps flex:1 and
+        // fills whatever's left.
+        function applySplitRatio() {
+            if (!editorPane) return;
+            var pct = Math.max(0.15, Math.min(0.85, splitRatio)) * 100;
+            editorPane.style.flex = '0 0 ' + pct + '%';
+        }
+
+        // Seed view preferences from C# (SettingsService). Called once after the
+        // page loads, before any file tab is opened.
+        function applyViewPreferences(expanded, ratio, horizontal) {
+            defaultExpanded = !!expanded;
+            if (typeof ratio === 'number' && !isNaN(ratio)) {
+                splitRatio = Math.max(0.15, Math.min(0.85, ratio));
+            }
+            defaultHorizontal = !!horizontal;
+            applySplitDirection(defaultHorizontal); // also applies the ratio
+        }
+
+        // --- Splitter drag handling ---
+        (function initSplitter() {
+            var splitter = document.getElementById('paneSplitter');
+            if (!splitter) return;
+            var container = document.querySelector('.editor-container');
+            var dragging = false;
+
+            function onMouseMove(e) {
+                if (!dragging) return;
+                var rect = container.getBoundingClientRect();
+                var ratio = isHorizontalSplit
+                    ? (e.clientY - rect.top) / rect.height
+                    : (e.clientX - rect.left) / rect.width;
+                if (isNaN(ratio)) return;
+                splitRatio = Math.max(0.15, Math.min(0.85, ratio));
+                applySplitRatio();
+                e.preventDefault();
+            }
+
+            function onMouseUp() {
+                if (!dragging) return;
+                dragging = false;
+                splitter.classList.remove('dragging');
+                container.classList.remove('resizing');
+                document.removeEventListener('mousemove', onMouseMove);
+                document.removeEventListener('mouseup', onMouseUp);
+                // Persist the new ratio across sessions.
+                notifySplitRatioChanged(splitRatio);
+            }
+
+            splitter.addEventListener('mousedown', function (e) {
+                // Don't start a drag while the editor pane is collapsed (fullscreen).
+                if (isFullscreen) return;
+                dragging = true;
+                splitter.classList.add('dragging');
+                container.classList.add('resizing');
+                document.addEventListener('mousemove', onMouseMove);
+                document.addEventListener('mouseup', onMouseUp);
+                e.preventDefault();
+            });
+
+            // Double-click resets to a 50/50 split.
+            splitter.addEventListener('dblclick', function () {
+                splitRatio = 0.5;
+                applySplitRatio();
+                notifySplitRatioChanged(splitRatio);
+            });
+        })();
+
+        function isAbsoluteUrl(u) {
+            if (!u) return false;
+            return /^[a-z][a-z0-9+\-.]*:/i.test(u) || u.indexOf('//') === 0 || u.charAt(0) === '#';
+        }
+
+        function resolveAgainstBase(baseUrl, relative) {
+            try { return new URL(relative, baseUrl).href; }
+            catch (e) { return relative; }
+        }
+
+        // Rewrites relative href/src against the active tab's baseUrl so
+        // documents loaded from a URL render images and follow links correctly.
+        // Tags relative .md/.markdown anchors with data-md-relative so the
+        // link-click handler can intercept them and open a new URL tab.
+        function rewriteRelativeUrls(root, baseUrl) {
+            if (!baseUrl || !root) return;
+            var imgs = root.querySelectorAll('img');
+            for (var i = 0; i < imgs.length; i++) {
+                var src = imgs[i].getAttribute('src');
+                if (src && !isAbsoluteUrl(src)) {
+                    imgs[i].setAttribute('src', resolveAgainstBase(baseUrl, src));
+                }
+            }
+            var links = root.querySelectorAll('a');
+            for (var j = 0; j < links.length; j++) {
+                var href = links[j].getAttribute('href');
+                if (!href || isAbsoluteUrl(href)) continue;
+                var resolved = resolveAgainstBase(baseUrl, href);
+                links[j].setAttribute('href', resolved);
+                var lower = href.toLowerCase().split('#')[0].split('?')[0];
+                if (lower.endsWith('.md') || lower.endsWith('.markdown')) {
+                    links[j].setAttribute('data-md-relative', resolved);
+                }
+            }
+        }
+
+        function updatePreview() {
+            var currentGeneration = ++renderGeneration;
+            var text = editor.value;
+            preview.innerHTML = marked.parse(text);
+
+            // If the active tab was loaded from a URL, resolve relative
+            // image/link refs against its base URL.
+            var activeTab = activeTabId ? tabs[activeTabId] : null;
+            if (activeTab && activeTab.baseUrl) {
+                rewriteRelativeUrls(preview, activeTab.baseUrl);
+            }
+
+            // Apply syntax highlighting to all code blocks
+            var statusMsg = 'Ready';
+            if (typeof hljs !== 'undefined') {
+                // Only highlight blocks with an explicit language class — skip hljs auto-detection on no-language fences
+                var blocks = preview.querySelectorAll('pre code[class*="language-"]');
+                if (blocks.length > 0) {
+                    blocks.forEach(function(block) {
+                        // Remove any existing highlighting
+                        block.removeAttribute('data-highlighted');
+                        try {
+                            hljs.highlightElement(block);
+                            statusMsg = 'Highlighted ' + blocks.length + ' code block(s)';
+                        } catch (err) {
+                            statusMsg = 'Highlight error: ' + err.message;
+                        }
+                    });
+                }
+            } else {
+                statusMsg = 'WARNING: hljs not defined!';
+            }
+
+            // Render Mermaid diagrams asynchronously to prevent blocking
+            if (typeof mermaid !== 'undefined') {
+                var mermaidDivs = preview.querySelectorAll('.mermaid');
+                if (mermaidDivs.length > 0) {
+                    var diagramCount = mermaidDivs.length;
+                    // Use requestAnimationFrame to avoid blocking the UI thread
+                    requestAnimationFrame(function() {
+                        // Cancel if a newer render has started
+                        if (currentGeneration !== renderGeneration) return;
+                        try {
+                            mermaid.run({
+                                nodes: mermaidDivs
+                            });
+                        } catch (err) {
+                            console.error('Mermaid error:', err);
+                        }
+                    });
+                    statusMsg += ' | ' + diagramCount + ' diagram(s)';
+                }
+            }
+
+            setStatus(statusMsg);
+            updateStats();
+        }
+
+        function updateStats() {
+            var text = editor.value;
+            var lines = text.split('\n').length;
+            var words = text.trim() ? text.trim().split(/\s+/).length : 0;
+            statsEl.textContent = 'Lines: ' + lines + ' | Words: ' + words;
+        }
+        
+        // Scroll synchronization
+        var syncingScroll = false;
+        var scrollSyncEnabled = true; // Default enabled
+        
+        function syncScroll(source, target) {
+            if (syncingScroll || !scrollSyncEnabled) return;
+
+            syncingScroll = true;
+            var percentage = source.scrollTop / (source.scrollHeight - source.clientHeight);
+            if (isNaN(percentage)) percentage = 0;
+            target.scrollTop = percentage * (target.scrollHeight - target.clientHeight);
+
+            setTimeout(function() {
+                syncingScroll = false;
+            }, 10);
+        }
+        
+        function toggleScrollSync() {
+            var checkbox = document.getElementById('syncScrollCheckbox');
+            scrollSyncEnabled = checkbox.checked;
+            
+            // When enabling sync, align editor to preview's current position
+            if (scrollSyncEnabled) {
+                syncScroll(preview, editor);
+            }
+        }
+        
+        // Sync scroll handlers - must be set after page load (WebView2 timing issue)
+        setTimeout(function() {
+            if (editor) {
+                editor.onscroll = function() {
+                    if (scrollSyncEnabled) {
+                        syncScroll(editor, preview);
+                    }
+                };
+            }
+            if (preview) {
+                preview.onscroll = function() {
+                    if (scrollSyncEnabled) {
+                        syncScroll(preview, editor);
+                    }
+                };
+            }
+        }, 500);
+        
+        function toggleDarkMode() {
+            document.body.classList.toggle('dark-mode');
+            var isDark = document.body.classList.contains('dark-mode');
+
+            // Update button text
+            var btn = document.getElementById('darkModeBtn');
+            if (btn) {
+                btn.textContent = isDark ? '☀️ Light Mode' : '🌓 Dark Mode';
+            }
+
+            // Notify C# so _isDarkMode and View menu stay in sync
+            if (window.chrome && window.chrome.webview) {
+                window.chrome.webview.postMessage({ type: 'darkModeChanged', isDark: isDark });
+            }
+        }
+        
+        function setDarkMode(enabled) {
+            // Convert string to boolean if needed
+            if (typeof enabled === 'string') {
+                enabled = enabled === 'true';
+            }
+            
+            if (enabled) {
+                document.body.classList.add('dark-mode');
+            } else {
+                document.body.classList.remove('dark-mode');
+            }
+            
+            // Update button text
+            var btn = document.getElementById('darkModeBtn');
+            if (btn) {
+                btn.textContent = enabled ? '☀️ Light' : '🌓 Dark';
+            }
+        }
+
+        function setStatus(msg) {
+            statusEl.textContent = msg;
+            setTimeout(function() { statusEl.textContent = 'Ready'; }, 3000);
+        }
+
+        // Called from C# to get editor content
+        function getEditorContent() {
+            return editor.value;
+        }
+
+        // Called from C# to load content (legacy - for backward compatibility)
+        // Prefer using addTab for multi-file support
+        function loadContent(content, filename) {
+            editor.value = content;
+            setStatus('Loading: ' + filename);
+
+            // Update preview without marking as dirty (this is a load, not an edit)
+            var text = editor.value;
+            preview.innerHTML = marked.parse(text);
+
+            // Apply syntax highlighting
+            if (typeof hljs !== 'undefined') {
+                // Only highlight blocks with an explicit language class — skip hljs auto-detection on no-language fences
+                var blocks = preview.querySelectorAll('pre code[class*="language-"]');
+                blocks.forEach(function(block) {
+                    block.removeAttribute('data-highlighted');
+                    try { hljs.highlightElement(block); } catch (err) {}
+                });
+            }
+
+            // Render Mermaid diagrams
+            if (typeof mermaid !== 'undefined') {
+                var mermaidDivs = preview.querySelectorAll('.mermaid');
+                if (mermaidDivs.length > 0) {
+                    requestAnimationFrame(function() {
+                        try { mermaid.run({ nodes: mermaidDivs }); } catch (err) {}
+                    });
+                }
+            }
+
+            updateStats();
+            isDirty = false;
+        }
+
+        // Called from C# for messages
+        function receiveMessage(type, data) {
+            if (type === 'fileSaved') {
+                isDirty = false;
+                setStatus('Saved: ' + data);
+            } else if (type === 'statusMessage') {
+                setStatus(data);
+            }
+        }
+
+        // Formatting helpers
+        function insertBold() { wrapSelection('**', '**'); }
+        function insertItalic() { wrapSelection('*', '*'); }
+        function insertCode() { wrapSelection('`', '`'); }
+        function insertCodeBlock() { wrapSelection('\n```\n', '\n```\n'); }
+        function insertH1() { insertAtLineStart('# '); }
+        function insertH2() { insertAtLineStart('## '); }
+        function insertH3() { insertAtLineStart('### '); }
+        function insertBulletList() { insertAtLineStart('- '); }
+        function insertNumberList() { insertAtLineStart('1. '); }
+        function insertQuote() { insertAtLineStart('> '); }
+        function insertHr() { insertText('\n---\n'); }
+
+        function insertLink() {
+            var sel = getSelection();
+            var url = prompt('Enter URL:', 'https://');
+            if (url) {
+                insertText('[' + (sel || 'link text') + '](' + url + ')');
+            }
+        }
+
+        function insertImage() {
+            var url = prompt('Enter image URL:', 'https://');
+            if (url) {
+                var alt = prompt('Enter alt text:', 'image');
+                insertText('![' + (alt || 'image') + '](' + url + ')');
+            }
+        }
+
+        function insertTable() {
+            var table = '\n| Header 1 | Header 2 | Header 3 |\n|----------|----------|----------|\n| Cell 1   | Cell 2   | Cell 3   |\n| Cell 4   | Cell 5   | Cell 6   |\n';
+            insertText(table);
+        }
+
+        function wrapSelection(before, after) {
+            var start = editor.selectionStart;
+            var end = editor.selectionEnd;
+            var sel = editor.value.substring(start, end) || 'text';
+            editor.focus();
+            editor.setSelectionRange(start, end);
+            document.execCommand('insertText', false, before + sel + after);
+            // Restore selection to just the inner text
+            editor.setSelectionRange(start + before.length, start + before.length + sel.length);
+        }
+
+        function insertAtLineStart(prefix) {
+            var start = editor.selectionStart;
+            var text = editor.value;
+            var lineStart = text.lastIndexOf('\n', start - 1) + 1;
+            editor.focus();
+            editor.setSelectionRange(lineStart, lineStart);
+            document.execCommand('insertText', false, prefix);
+            editor.setSelectionRange(start + prefix.length, start + prefix.length);
+        }
+
+        function getSelection() {
+            return editor.value.substring(editor.selectionStart, editor.selectionEnd);
+        }
+
+        function insertText(text) {
+            var start = editor.selectionStart;
+            var end = editor.selectionEnd;
+            editor.focus();
+            editor.setSelectionRange(start, end);
+            document.execCommand('insertText', false, text);
+        }
+
+        // Keyboard shortcuts
+        editor.addEventListener('keydown', function(e) {
+            if (e.ctrlKey) {
+                if (e.key === 'b' || e.key === 'B') { e.preventDefault(); insertBold(); }
+                else if (e.key === 'i' || e.key === 'I') { e.preventDefault(); insertItalic(); }
+                else if (e.key === 's' || e.key === 'S') {
+                    e.preventDefault();
+                    if (window.chrome && window.chrome.webview) {
+                        window.chrome.webview.postMessage({ type: 'saveRequested' });
+                    }
+                }
+            }
+        });
+
+        // Intercept anchor clicks in the preview:
+        //   - .md / .markdown relative links → open as a new URL tab in the editor
+        //   - other http(s) absolute links  → open in the system default browser
+        //   - in-document fragment links    → pass through
+        preview.addEventListener('click', function(e) {
+            var a = e.target.closest ? e.target.closest('a') : null;
+            if (!a) return;
+
+            var mdRelative = a.getAttribute('data-md-relative');
+            if (mdRelative) {
+                e.preventDefault();
+                if (window.chrome && window.chrome.webview) {
+                    window.chrome.webview.postMessage({ type: 'openUrl', url: mdRelative });
+                }
+                return;
+            }
+
+            var href = a.getAttribute('href');
+            if (!href || href.charAt(0) === '#') return;
+            if (/^https?:/i.test(href)) {
+                e.preventDefault();
+                if (window.chrome && window.chrome.webview) {
+                    window.chrome.webview.postMessage({ type: 'openExternal', url: href });
+                }
+            }
+        });
+
+        // Initialize
+        updatePreview();

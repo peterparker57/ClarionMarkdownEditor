@@ -27,7 +27,6 @@ namespace ClarionMarkdownEditor
             if (!string.IsNullOrEmpty(fileName) && File.Exists(fileName))
             {
                 _fileName = fileName;
-                TitleName = Path.GetFileName(fileName);
             }
         }
 
@@ -66,10 +65,27 @@ namespace ClarionMarkdownEditor
                 if (_fileName != value)
                 {
                     _fileName = value;
-                    TitleName = string.IsNullOrEmpty(value) ? "Markdown Editor" : Path.GetFileName(value);
+                    TitleName = "Markdown Editor";
                     OnFileNameChanged(EventArgs.Empty);
                 }
             }
+        }
+
+        /// <summary>
+        /// Returns true if this editor instance has the given file open as a tab.
+        /// </summary>
+        public bool HasFileOpen(string filePath)
+        {
+            return _control?.HasFileOpen(filePath) ?? false;
+        }
+
+        /// <summary>
+        /// Switches the internal editor to the tab for the given file and activates this window.
+        /// </summary>
+        public void SwitchToFile(string filePath)
+        {
+            _control?.SwitchToFileTab(filePath);
+            WorkbenchWindow?.SelectWindow();
         }
 
         /// <summary>
@@ -78,8 +94,9 @@ namespace ClarionMarkdownEditor
         public override void Load(string fileName)
         {
             _fileName = fileName;
-            TitleName = Path.GetFileName(fileName);
-            // The control handles file loading through its own mechanisms
+            TitleName = "Markdown Editor";
+            if (_control != null && File.Exists(fileName))
+                _control.LoadFile(fileName);
             OnFileNameChanged(EventArgs.Empty);
         }
 
@@ -91,7 +108,7 @@ namespace ClarionMarkdownEditor
             if (!string.IsNullOrEmpty(fileName))
             {
                 _fileName = fileName;
-                TitleName = Path.GetFileName(fileName);
+                TitleName = "Markdown Editor";
                 IsDirty = false;
                 OnFileNameChanged(EventArgs.Empty);
             }
@@ -118,20 +135,14 @@ namespace ClarionMarkdownEditor
             _control?.RefreshContent();
         }
 
-        /// <summary>
-        /// Event raised when dirty state changes.
-        /// </summary>
-        protected virtual void OnDirtyChanged(EventArgs e)
+        protected override void OnDirtyChanged(EventArgs e)
         {
-            // Notify the workbench that dirty state has changed
+            base.OnDirtyChanged(e);
         }
 
-        /// <summary>
-        /// Event raised when file name changes.
-        /// </summary>
-        protected virtual void OnFileNameChanged(EventArgs e)
+        protected override void OnFileNameChanged(EventArgs e)
         {
-            // Notify the workbench that file name has changed
+            base.OnFileNameChanged(e);
         }
     }
 }

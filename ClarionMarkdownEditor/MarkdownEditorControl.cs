@@ -18,6 +18,23 @@ namespace ClarionMarkdownEditor
         public string FilePath { get; set; }
         public string FileName { get; set; }
         public bool IsDirty { get; set; }
+
+        // Last content we synced with disk (line endings normalized to \n). Used by
+        // the file watcher to distinguish an external edit from our own save / a
+        // no-op touch: if the newly-read disk content equals this, there's nothing
+        // to do. Set whenever we load from or write to the file.
+        public string DiskContent { get; set; }
+
+        // Set when the tab was loaded from a URL (Open Markdown from URL...). Carries the
+        // resolved fetch URL so relative-link clicks and "Save a copy" can resolve correctly.
+        public string SourceUrl { get; set; }
+
+        // BaseUrl (directory part of SourceUrl, ending in "/") for resolving relative
+        // image/link URLs inside the Markdown.
+        public string SourceBaseUrl { get; set; }
+
+        // True for URL-loaded tabs until "Save a copy locally..." makes them a real file.
+        public bool IsReadOnly { get; set; }
     }
 
     /// <summary>
@@ -39,6 +56,8 @@ namespace ClarionMarkdownEditor
     {
         private const int MAX_RECENT_FILES = 30;
         private const string RECENT_FILES_KEY = "RecentFiles";
+        private const int MAX_RECENT_URLS = 15;
+        private const string RECENT_URLS_KEY = "RecentUrls";
 
         private readonly EditorService _editorService;
         private readonly SettingsService _settingsService;
@@ -46,6 +65,9 @@ namespace ClarionMarkdownEditor
         private string _tempHtmlPath;
         private bool _isWebView2Ready = false;
         private bool _initializationStarted = false;
+        private string _pendingFilePath = null;
+        private string _pendingUrl = null;
+        private bool _isDarkMode = false;
 
         // Tab tracking fields
         private Dictionary<string, FileTab> _openTabs = new Dictionary<string, FileTab>();
@@ -55,11 +77,44 @@ namespace ClarionMarkdownEditor
         // Message filter for closing menus when clicking WebView2
         private WebView2MenuCloseFilter _menuCloseFilter;
 
+        // Watches the on-disk files backing open tabs so external edits (Claude/CA,
+        // VS Code, etc.) auto-refresh clean tabs and flag dirty ones.
+        private readonly TabFileWatcher _fileWatcher;
+
+        // All live instances (pad + document) — used for cross-instance file collision detection
+        private static readonly List<MarkdownEditorControl> _allInstances = new List<MarkdownEditorControl>();
+        private static readonly object _allInstancesLock = new object();
+
+        partial void OnCustomDispose()
+        {
+            lock (_allInstancesLock) _allInstances.Remove(this);
+
+            _fileWatcher?.Dispose();
+
+            if (_menuCloseFilter != null)
+            {
+                Application.RemoveMessageFilter(_menuCloseFilter);
+                _menuCloseFilter = null;
+            }
+
+            if (!string.IsNullOrEmpty(_tempHtmlPath) && File.Exists(_tempHtmlPath))
+            {
+                try { File.Delete(_tempHtmlPath); }
+                catch { /* ignore cleanup errors */ }
+            }
+        }
+
         public MarkdownEditorControl()
         {
+            lock (_allInstancesLock) _allInstances.Add(this);
             InitializeComponent();
             _editorService = new EditorService();
             _settingsService = new SettingsService();
+
+            // Auto-refresh: watch backing files for external changes.
+            _fileWatcher = new TabFileWatcher(this);
+            _fileWatcher.FileChanged += OnDiskFileChanged;
+            _fileWatcher.FileRemoved += OnDiskFileRemoved;
 
             // Install message filter to close menus when clicking inside WebView2
             _menuCloseFilter = new WebView2MenuCloseFilter(this, webView, menuStrip);
@@ -149,7 +204,7 @@ namespace ClarionMarkdownEditor
                 if (File.Exists(htmlPath))
                 {
                     var html = File.ReadAllText(htmlPath);
-                    html = InjectHighlightJs(html);
+                    html = InjectScripts(html);
                     
                     // Write modified HTML to temp location
                     _tempHtmlPath = Path.Combine(resourcesPath, "markdown-editor-temp.html");
@@ -158,14 +213,45 @@ namespace ClarionMarkdownEditor
                     webView.CoreWebView2.Navigate("https://app.local/markdown-editor-temp.html");
                     System.Diagnostics.Debug.WriteLine("Navigated to modified HTML with Highlight.js injected");
 
-                    // Show Start Page after HTML loads
+                    // Show Start Page (or pending file) after HTML loads
                     webView.CoreWebView2.NavigationCompleted += async (s, args) =>
                     {
                         if (args.IsSuccess && _isWebView2Ready)
                         {
                             // Small delay to ensure JavaScript is fully initialized
                             await Task.Delay(100);
-                            ShowStartPage();
+                            // Restore dark mode preference
+                            _isDarkMode = _settingsService.Get("DarkMode") == "true";
+                            if (_isDarkMode)
+                                await webView.ExecuteScriptAsync("setDarkMode(true)");
+
+                            // Restore view preferences: Expand/Split, split ratio, split direction.
+                            var expandedPref = _settingsService.Get("DefaultExpanded") == "true" ? "true" : "false";
+                            var horizontalPref = _settingsService.Get("HorizontalSplit") == "true" ? "true" : "false";
+                            double ratioVal;
+                            if (!double.TryParse(_settingsService.Get("SplitRatio"),
+                                    System.Globalization.NumberStyles.Float,
+                                    System.Globalization.CultureInfo.InvariantCulture, out ratioVal))
+                                ratioVal = 0.5;
+                            var ratioArg = ratioVal.ToString(System.Globalization.CultureInfo.InvariantCulture);
+                            await webView.ExecuteScriptAsync(
+                                $"applyViewPreferences({expandedPref}, {ratioArg}, {horizontalPref})");
+                            if (!string.IsNullOrEmpty(_pendingFilePath))
+                            {
+                                var path = _pendingFilePath;
+                                _pendingFilePath = null;
+                                OpenFile(path);
+                            }
+                            else if (!string.IsNullOrEmpty(_pendingUrl))
+                            {
+                                var url = _pendingUrl;
+                                _pendingUrl = null;
+                                _ = LoadUrlAsync(url);
+                            }
+                            else
+                            {
+                                ShowStartPage();
+                            }
                         }
                     };
                 }
@@ -283,7 +369,7 @@ namespace ClarionMarkdownEditor
             }
         }
 
-        private string InjectHighlightJs(string html)
+        private string InjectScripts(string html)
         {
             var injectionLog = "INJECTION DEBUG: ";
             try
@@ -291,7 +377,20 @@ namespace ClarionMarkdownEditor
                 // Get the directory where the addin is deployed
                 var addinDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
                 injectionLog += $"addinDir={addinDir}; ";
-                
+
+                // Load marked (markdown parser)
+                var markedPath = Path.Combine(addinDir, "Resources", "marked.min.js");
+                if (File.Exists(markedPath))
+                {
+                    var marked = File.ReadAllText(markedPath);
+                    html = html.Replace("<!-- INJECT_MARKED_JS -->", $"<script>\n{marked}\n    </script>");
+                    injectionLog += "marked injected; ";
+                }
+                else
+                {
+                    injectionLog += "marked NOT FOUND; ";
+                }
+
                 // Load highlight.js CSS
                 var cssPath = Path.Combine(addinDir, "Resources", "atom-one-dark.min.css");
                 injectionLog += $"cssPath={cssPath}; ";
@@ -305,7 +404,7 @@ namespace ClarionMarkdownEditor
                 {
                     injectionLog += "CSS NOT FOUND; ";
                 }
-                
+
                 // Load highlight.js JavaScript
                 var jsPath = Path.Combine(addinDir, "Resources", "highlight.min.js");
                 injectionLog += $"jsPath={jsPath}; ";
@@ -321,7 +420,7 @@ namespace ClarionMarkdownEditor
                 {
                     injectionLog += "JS NOT FOUND; ";
                 }
-                
+
                 // Inject Clarion language definition
                 var clarionLang = GetClarionLanguageDefinition();
                 html = html.Replace("<!-- INJECT_CLARION_LANG -->", $"<script>\n{clarionLang}\n    </script>");
@@ -616,10 +715,220 @@ namespace ClarionMarkdownEditor
             SaveRecentFiles(files);
         }
 
+        private List<string> GetRecentUrls()
+        {
+            var stored = _settingsService.Get(RECENT_URLS_KEY);
+            if (string.IsNullOrEmpty(stored)) return new List<string>();
+
+            return stored.Split('|')
+                .Where(u => !string.IsNullOrEmpty(u))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList();
+        }
+
+        private void SaveRecentUrls(List<string> urls)
+        {
+            _settingsService.Set(RECENT_URLS_KEY, string.Join("|", urls));
+        }
+
+        private void AddToRecentUrls(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url)) return;
+            url = url.Trim();
+
+            var urls = GetRecentUrls();
+            urls.RemoveAll(u => string.Equals(u, url, StringComparison.OrdinalIgnoreCase));
+            urls.Insert(0, url);
+            if (urls.Count > MAX_RECENT_URLS)
+                urls = urls.Take(MAX_RECENT_URLS).ToList();
+            SaveRecentUrls(urls);
+            _ = RefreshRecentUrlsInStartPage();
+        }
+
+        private void RemoveRecentUrlByIndex(int index)
+        {
+            var urls = GetRecentUrls();
+            if (index < 0 || index >= urls.Count) return;
+            urls.RemoveAt(index);
+            SaveRecentUrls(urls);
+            _ = RefreshRecentUrlsInStartPage();
+        }
+
+        public void LoadFile(string filePath)
+        {
+            if (!_isWebView2Ready)
+            {
+                _pendingFilePath = filePath;
+                return;
+            }
+            OpenFile(filePath);
+        }
+
+        /// <summary>
+        /// Loads a Markdown document from a URL into a new read-only tab.
+        /// Defers if WebView2 isn't ready yet; the post-init handler replays.
+        /// </summary>
+        public async Task LoadUrlAsync(string url)
+        {
+            if (string.IsNullOrWhiteSpace(url)) return;
+
+            if (!_isWebView2Ready)
+            {
+                _pendingUrl = url;
+                return;
+            }
+
+            UrlNormalizer.NormalizedUrl normalized;
+            try
+            {
+                normalized = UrlNormalizer.Normalize(url);
+            }
+            catch (ArgumentException ex)
+            {
+                MessageBox.Show(
+                    "Invalid URL: " + ex.Message,
+                    "Open Markdown from URL",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            var result = await MarkdownUrlCache.GetOrFetchAsync(normalized).ConfigureAwait(true);
+
+            if (!result.Success)
+            {
+                MessageBox.Show(
+                    FormatFetchError(url, result),
+                    "Open Markdown from URL",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            var resolvedUrl = result.ResolvedUrl ?? normalized.PrimaryUrl;
+            var baseUrl = !string.IsNullOrEmpty(normalized.BaseUrl)
+                ? normalized.BaseUrl
+                : DeriveBaseUrlFromResolved(resolvedUrl);
+            var tabName = DeriveTabNameFromUrl(resolvedUrl);
+            if (result.IsStale) tabName += " (offline)";
+
+            var tabId = GenerateTabId();
+            var tab = new FileTab
+            {
+                Id = tabId,
+                FilePath = null,
+                FileName = tabName,
+                IsDirty = false,
+                SourceUrl = resolvedUrl,
+                SourceBaseUrl = baseUrl,
+                IsReadOnly = true
+            };
+
+            _openTabs[tabId] = tab;
+            _activeTabId = tabId;
+            _currentFilePath = null;
+
+            AddTabToJs(tabId, tabName, result.Content ?? string.Empty, null, isReadOnly: true, baseUrl: baseUrl);
+
+            if (result.IsStale)
+            {
+                var detail = string.IsNullOrEmpty(result.ErrorMessage) ? "offline" : result.ErrorMessage;
+                SendMessageToJs("statusMessage", $"Loaded from cache ({detail})");
+            }
+
+            // Keep the user's original URL on the recent list (not the resolved
+            // one) so probe + fallback behaviour replays the next time too.
+            AddToRecentUrls(url);
+        }
+
+        private static string DeriveTabNameFromUrl(string url)
+        {
+            try
+            {
+                var uri = new Uri(url);
+                var segs = uri.AbsolutePath.Trim('/').Split('/');
+                var file = segs.Length > 0 && segs[segs.Length - 1].Length > 0
+                    ? segs[segs.Length - 1]
+                    : "document.md";
+
+                if (uri.Host.Equals("raw.githubusercontent.com", StringComparison.OrdinalIgnoreCase)
+                    && segs.Length >= 4)
+                {
+                    return $"{file} ({segs[0]}/{segs[1]})";
+                }
+                return file;
+            }
+            catch
+            {
+                return "Untitled URL";
+            }
+        }
+
+        private static string FormatFetchError(string requestedUrl, FetchResult result)
+        {
+            string headline;
+            if (result.StatusCode == 404)
+                headline = "Not found (HTTP 404). Check the URL is correct.";
+            else if (result.StatusCode == 401 || result.StatusCode == 403)
+                headline = "Access denied (HTTP " + result.StatusCode + "). The document may be private.";
+            else if (result.StatusCode >= 500 && result.StatusCode < 600)
+                headline = "The server returned an error (HTTP " + result.StatusCode + "). Try again later.";
+            else if (!string.IsNullOrEmpty(result.ErrorMessage) &&
+                     result.ErrorMessage.IndexOf("timed out", StringComparison.OrdinalIgnoreCase) >= 0)
+                headline = "The request timed out. Check your internet connection and try again.";
+            else if (!string.IsNullOrEmpty(result.ErrorMessage))
+                headline = "Couldn't reach the server: " + result.ErrorMessage;
+            else
+                headline = "Couldn't load the URL.";
+
+            return headline + "\r\n\r\n" + requestedUrl;
+        }
+
+        private static string DeriveBaseUrlFromResolved(string url)
+        {
+            int q = url.IndexOf('?');
+            if (q >= 0) url = url.Substring(0, q);
+            int h = url.IndexOf('#');
+            if (h >= 0) url = url.Substring(0, h);
+            int slash = url.LastIndexOf('/');
+            return slash > 8 ? url.Substring(0, slash + 1) : url;
+        }
+
+        /// <summary>
+        /// Returns true if this control instance already has the given file open as a tab.
+        /// </summary>
+        public bool HasFileOpen(string filePath)
+        {
+            return _openTabs.Values.Any(t =>
+                !string.IsNullOrEmpty(t.FilePath) &&
+                string.Equals(t.FilePath, filePath, StringComparison.OrdinalIgnoreCase));
+        }
+
+        /// <summary>
+        /// Switches to the tab for the given file and activates this control's parent window.
+        /// </summary>
+        public void SwitchToFileTab(string filePath)
+        {
+            var tab = _openTabs.Values.FirstOrDefault(t =>
+                !string.IsNullOrEmpty(t.FilePath) &&
+                string.Equals(t.FilePath, filePath, StringComparison.OrdinalIgnoreCase));
+            if (tab != null)
+            {
+                SwitchToTab(tab.Id);
+                // Bring parent window to front
+                var form = FindForm();
+                form?.Activate();
+            }
+        }
+
         private void OpenFile(string filePath)
         {
+            Log($"OpenFile called: '{filePath}'");
+            Log($"OpenFile _openTabs count: {_openTabs.Count}");
+            foreach (var t in _openTabs.Values)
+                Log($"  tab '{t.Id}' FilePath='{t.FilePath}'");
+
             if (!File.Exists(filePath))
             {
+                Log($"OpenFile: file not found");
                 MessageBox.Show($"File not found:\n{filePath}", "Error",
                     MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 var files = GetRecentFiles();
@@ -628,19 +937,58 @@ namespace ClarionMarkdownEditor
                 return;
             }
 
-            // Check if file is already open in a tab
+            // Check if file is already open in a tab in this instance
             var existingTab = _openTabs.Values.FirstOrDefault(t =>
                 !string.IsNullOrEmpty(t.FilePath) &&
                 string.Equals(t.FilePath, filePath, StringComparison.OrdinalIgnoreCase));
 
+            Log($"OpenFile existingTab: {(existingTab != null ? existingTab.Id : "null")}");
+
             if (existingTab != null)
             {
+                Log($"OpenFile: switching to existing tab {existingTab.Id}");
                 // Switch to existing tab
                 SwitchToTab(existingTab.Id);
                 // Still update recent files to move to top
                 AddToRecentFiles(filePath);
                 _ = RefreshRecentFilesInStartPage();
                 return;
+            }
+
+            // Check if the file is open in a different editor instance (pad or document tab)
+            MarkdownEditorControl otherControl;
+            lock (_allInstancesLock)
+                otherControl = _allInstances.FirstOrDefault(c => c != this && c.HasFileOpen(filePath));
+            Log($"OpenFile otherControl: {(otherControl != null ? "found" : "null")}, _allInstances.Count={_allInstances.Count}");
+
+            if (otherControl != null)
+            {
+                var result = MessageBox.Show(
+                    $"{Path.GetFileName(filePath)} is already open in another editor instance.\n\n" +
+                    "Yes  — Switch to that instance\n" +
+                    "No   — Open here anyway\n" +
+                    "Cancel — Do nothing",
+                    "File Already Open",
+                    MessageBoxButtons.YesNoCancel,
+                    MessageBoxIcon.Information,
+                    MessageBoxDefaultButton.Button1);
+
+                if (result == DialogResult.Yes)
+                {
+                    otherControl.SwitchToFileTab(filePath);
+                    // Also activate the workbench window if it's a document tab
+                    var docContent = ICSharpCode.SharpDevelop.Gui.WorkbenchSingleton.Workbench
+                        ?.ViewContentCollection
+                        .OfType<MarkdownEditorViewContent>()
+                        .FirstOrDefault(vc => vc.Control == otherControl);
+                    docContent?.WorkbenchWindow?.SelectWindow();
+                    return;
+                }
+                else if (result == DialogResult.Cancel)
+                {
+                    return;
+                }
+                // No = fall through and open in this instance
             }
 
             // Create a new tab for this file
@@ -653,7 +1001,8 @@ namespace ClarionMarkdownEditor
                 Id = tabId,
                 FilePath = filePath,
                 FileName = fileName,
-                IsDirty = false
+                IsDirty = false,
+                DiskContent = NormalizeLineEndings(content)
             };
 
             _openTabs[tabId] = tab;
@@ -663,6 +1012,8 @@ namespace ClarionMarkdownEditor
 
             // Call JavaScript to add the tab
             AddTabToJs(tabId, fileName, content, filePath);
+
+            _fileWatcher.Watch(filePath);
 
             AddToRecentFiles(filePath);
             _ = RefreshRecentFilesInStartPage();
@@ -727,7 +1078,7 @@ namespace ClarionMarkdownEditor
             }
         }
 
-        private void SaveMarkdownFile()
+        private async void SaveMarkdownFile()
         {
             if (string.IsNullOrEmpty(_activeTabId) || !_openTabs.TryGetValue(_activeTabId, out var activeTab))
             {
@@ -740,18 +1091,19 @@ namespace ClarionMarkdownEditor
                 return;
             }
 
-            string content = GetEditorContent();
+            string content = await GetEditorContentAsync();
             if (content != null)
             {
                 File.WriteAllText(activeTab.FilePath, content);
                 activeTab.IsDirty = false;
+                activeTab.DiskContent = NormalizeLineEndings(content);
                 _currentFilePath = activeTab.FilePath;
                 SendMessageToJs("fileSaved", activeTab.FilePath);
                 ClearDirtyIndicatorInJs(_activeTabId);
             }
         }
 
-        private void SaveMarkdownFileAs()
+        private async void SaveMarkdownFileAs()
         {
             if (string.IsNullOrEmpty(_activeTabId) || !_openTabs.TryGetValue(_activeTabId, out var activeTab))
             {
@@ -776,20 +1128,37 @@ namespace ClarionMarkdownEditor
 
                 if (dialog.ShowDialog() == DialogResult.OK)
                 {
-                    string content = GetEditorContent();
+                    string content = await GetEditorContentAsync();
                     if (content != null)
                     {
                         File.WriteAllText(dialog.FileName, content);
 
-                        // Update tab with new file path
+                        // Saving a URL-loaded tab locally promotes it to a regular
+                        // editable file tab — clear the read-only / URL provenance.
+                        bool wasReadOnly = activeTab.IsReadOnly;
+                        var previousPath = activeTab.FilePath;
                         activeTab.FilePath = dialog.FileName;
                         activeTab.FileName = Path.GetFileName(dialog.FileName);
                         activeTab.IsDirty = false;
+                        activeTab.IsReadOnly = false;
+                        activeTab.SourceUrl = null;
+                        activeTab.SourceBaseUrl = null;
+                        activeTab.DiskContent = NormalizeLineEndings(content);
+
+                        // Point the watcher at the new file (Save As to a different
+                        // path, or a URL/untitled tab becoming a real file).
+                        if (!string.IsNullOrEmpty(previousPath) &&
+                            !string.Equals(previousPath, dialog.FileName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            _fileWatcher.Unwatch(previousPath);
+                        }
+                        _fileWatcher.Watch(dialog.FileName);
 
                         _currentFilePath = dialog.FileName;
 
                         SendMessageToJs("fileSaved", dialog.FileName);
-                        UpdateTabInJs(_activeTabId, activeTab.FileName, dialog.FileName);
+                        UpdateTabInJs(_activeTabId, activeTab.FileName, dialog.FileName,
+                                      isReadOnly: wasReadOnly ? (bool?)false : null);
                         ClearDirtyIndicatorInJs(_activeTabId);
 
                         AddToRecentFiles(dialog.FileName);
@@ -835,13 +1204,7 @@ namespace ClarionMarkdownEditor
                 try
                 {
                     var result = await webView.ExecuteScriptAsync("getEditorContent()");
-                    // Remove surrounding quotes from JSON string
-                    if (result.StartsWith("\"") && result.EndsWith("\""))
-                    {
-                        result = result.Substring(1, result.Length - 2);
-                        result = result.Replace("\\n", "\n").Replace("\\r", "\r").Replace("\\\"", "\"");
-                    }
-                    return result;
+                    return DecodeJsonString(result);
                 }
                 catch (Exception ex)
                 {
@@ -859,6 +1222,75 @@ namespace ClarionMarkdownEditor
         {
             // Use GetAwaiter().GetResult() instead of .Wait() to avoid deadlocks
             return GetEditorContentAsync().GetAwaiter().GetResult();
+        }
+
+        /// <summary>
+        /// Decodes a JSON-encoded string returned by <c>WebView2.ExecuteScriptAsync</c>.
+        /// Handles every JSON string escape — including \uXXXX (and surrogate pairs) —
+        /// not just the three the old hand-rolled decoder covered.
+        /// </summary>
+        private static string DecodeJsonString(string json)
+        {
+            if (string.IsNullOrEmpty(json)) return json;
+            if (json == "null") return null;
+            if (json.Length < 2 || json[0] != '"' || json[json.Length - 1] != '"')
+            {
+                // Not a JSON string literal — return as-is.
+                return json;
+            }
+
+            var sb = new System.Text.StringBuilder(json.Length - 2);
+            int i = 1;
+            int end = json.Length - 1;
+            while (i < end)
+            {
+                char c = json[i];
+                if (c != '\\')
+                {
+                    sb.Append(c);
+                    i++;
+                    continue;
+                }
+                if (i + 1 >= end)
+                {
+                    sb.Append(c);
+                    i++;
+                    continue;
+                }
+                char esc = json[i + 1];
+                switch (esc)
+                {
+                    case '"': sb.Append('"'); i += 2; break;
+                    case '\\': sb.Append('\\'); i += 2; break;
+                    case '/': sb.Append('/'); i += 2; break;
+                    case 'b': sb.Append('\b'); i += 2; break;
+                    case 'f': sb.Append('\f'); i += 2; break;
+                    case 'n': sb.Append('\n'); i += 2; break;
+                    case 'r': sb.Append('\r'); i += 2; break;
+                    case 't': sb.Append('\t'); i += 2; break;
+                    case 'u':
+                        if (i + 6 <= end &&
+                            int.TryParse(json.Substring(i + 2, 4),
+                                         System.Globalization.NumberStyles.HexNumber,
+                                         System.Globalization.CultureInfo.InvariantCulture,
+                                         out int codeUnit))
+                        {
+                            sb.Append((char)codeUnit);
+                            i += 6;
+                        }
+                        else
+                        {
+                            sb.Append(esc);
+                            i += 2;
+                        }
+                        break;
+                    default:
+                        sb.Append(esc);
+                        i += 2;
+                        break;
+                }
+            }
+            return sb.ToString();
         }
 
         private void SendContentToJs(string content, string fileName)
@@ -987,6 +1419,8 @@ namespace ClarionMarkdownEditor
             }
 
             // Remove the tab
+            if (!string.IsNullOrEmpty(tab.FilePath))
+                _fileWatcher.Unwatch(tab.FilePath);
             _openTabs.Remove(tabId);
             RemoveTabFromJs(tabId);
 
@@ -1088,6 +1522,87 @@ namespace ClarionMarkdownEditor
                         }
                         break;
 
+                    case "contentChanged":
+                        {
+                            var tabId = ExtractJsonValue(message, "tabId");
+                            if (!string.IsNullOrEmpty(tabId) && _openTabs.TryGetValue(tabId, out var tab))
+                            {
+                                tab.IsDirty = true;
+                            }
+                        }
+                        break;
+
+                    case "saveRequested":
+                        SaveMarkdownFile();
+                        break;
+
+                    case "reloadRequested":
+                        {
+                            // User clicked the "changed on disk" badge on a tab.
+                            var tabId = ExtractNestedJsonValue(message, "data", "tabId");
+                            if (!string.IsNullOrEmpty(tabId))
+                                BeginInvoke(new Action(() => ReloadTabFromDisk(tabId, promptIfDirty: true)));
+                        }
+                        break;
+
+                    case "openUrl":
+                        {
+                            var openUrlTarget = ExtractJsonValue(message, "url");
+                            if (!string.IsNullOrEmpty(openUrlTarget))
+                                _ = LoadUrlAsync(openUrlTarget);
+                        }
+                        break;
+
+                    case "openExternal":
+                        {
+                            var externalUrl = ExtractJsonValue(message, "url");
+                            if (!string.IsNullOrEmpty(externalUrl) &&
+                                Uri.TryCreate(externalUrl, UriKind.Absolute, out var extUri) &&
+                                (extUri.Scheme == Uri.UriSchemeHttp || extUri.Scheme == Uri.UriSchemeHttps))
+                            {
+                                try { System.Diagnostics.Process.Start(extUri.ToString()); }
+                                catch (Exception ex)
+                                {
+                                    System.Diagnostics.Debug.WriteLine($"openExternal failed: {ex.Message}");
+                                }
+                            }
+                        }
+                        break;
+
+                    case "darkModeChanged":
+                        {
+                            var isDarkStr = ExtractJsonValue(message, "isDark");
+                            _isDarkMode = isDarkStr?.ToLower() == "true";
+                            _settingsService.Set("DarkMode", _isDarkMode ? "true" : "false");
+                        }
+                        break;
+
+                    case "viewModeChanged":
+                        {
+                            // User toggled Expand/Split — remember it as the default for new file tabs.
+                            var expanded = ExtractNestedJsonValue(message, "data", "expanded");
+                            _settingsService.Set("DefaultExpanded",
+                                expanded?.ToLower() == "true" ? "true" : "false");
+                        }
+                        break;
+
+                    case "splitRatioChanged":
+                        {
+                            // User dragged the splitter — persist the editor pane's fraction.
+                            var ratio = ExtractNestedJsonValue(message, "data", "ratio");
+                            if (!string.IsNullOrEmpty(ratio))
+                                _settingsService.Set("SplitRatio", ratio);
+                        }
+                        break;
+
+                    case "splitDirectionChanged":
+                        {
+                            var horizontal = ExtractNestedJsonValue(message, "data", "horizontal");
+                            _settingsService.Set("HorizontalSplit",
+                                horizontal?.ToLower() == "true" ? "true" : "false");
+                        }
+                        break;
+
                     case "tabDirtyChanged":
                         {
                             var tabId = ExtractNestedJsonValue(message, "data", "tabId");
@@ -1127,9 +1642,13 @@ namespace ClarionMarkdownEditor
 
                                 case "openRecentFile":
                                     var filePath = ExtractNestedJsonValue(message, "data", "filePath");
+                                    Log($"openRecentFile raw extracted: '{filePath}'");
                                     if (!string.IsNullOrEmpty(filePath))
                                     {
-                                        OpenFile(filePath);
+                                        // Defer out of WebView2 callback so cross-instance guard
+                                        // (MessageBox.Show) works the same as from a menu click
+                                        var fp = filePath;
+                                        BeginInvoke(new Action(() => OpenFile(fp)));
                                     }
                                     break;
 
@@ -1144,15 +1663,77 @@ namespace ClarionMarkdownEditor
                                 case "removeMissingFiles":
                                     RemoveMissingRecentFiles();
                                     break;
+
+                                case "openUrl":
+                                    BeginInvoke(new Action(() =>
+                                    {
+                                        var entered = UrlPromptDialog.Show(FindForm());
+                                        if (!string.IsNullOrWhiteSpace(entered))
+                                            _ = LoadUrlAsync(entered);
+                                    }));
+                                    break;
+
+                                case "openRecentUrl":
+                                    var recentUrl = ExtractNestedJsonValue(message, "data", "url");
+                                    if (!string.IsNullOrEmpty(recentUrl))
+                                    {
+                                        var u = recentUrl;
+                                        BeginInvoke(new Action(() => _ = LoadUrlAsync(u)));
+                                    }
+                                    break;
+
+                                case "removeRecentUrl":
+                                    var urlIndexStr = ExtractNestedJsonValue(message, "data", "index");
+                                    if (int.TryParse(urlIndexStr, out int urlIndex))
+                                        RemoveRecentUrlByIndex(urlIndex);
+                                    break;
                             }
+                        }
+                        break;
+
+                    case "debugLog":
+                        {
+                            var logMsg = ExtractJsonValue(message, "message");
+                            Log($"[JS] {logMsg}");
                         }
                         break;
                 }
             }
             catch (Exception ex)
             {
-                System.Diagnostics.Debug.WriteLine($"HandleWebMessage error: {ex.Message}");
+                System.Diagnostics.Debug.WriteLine($"[MarkdownEditor] HandleWebMessage error: {ex.Message}\n{ex.StackTrace}");
+                Log($"HandleWebMessage error: {ex.Message} | {ex.StackTrace}");
             }
+        }
+
+        [System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+        private static extern void OutputDebugString(string lpOutputString);
+
+        [System.Diagnostics.Conditional("DEBUG")]
+        private static void Log(string message)
+        {
+            OutputDebugString($"[MarkdownEditor] {message}");
+        }
+
+        private static string UnescapeJsonString(string value)
+        {
+            // Process each JSON escape sequence atomically to avoid double-processing
+            // (e.g. naive string.Replace would turn \\\" into " instead of \")
+            return System.Text.RegularExpressions.Regex.Replace(value, @"\\(.)", m =>
+            {
+                switch (m.Groups[1].Value[0])
+                {
+                    case '\\': return "\\";
+                    case '"':  return "\"";
+                    case '/':  return "/";
+                    case 'n':  return "\n";
+                    case 'r':  return "\r";
+                    case 't':  return "\t";
+                    case 'b':  return "\b";
+                    case 'f':  return "\f";
+                    default:   return m.Value; // preserve unknown escapes
+                }
+            });
         }
 
         /// <summary>
@@ -1160,10 +1741,9 @@ namespace ClarionMarkdownEditor
         /// </summary>
         private string ExtractJsonValue(string json, string key)
         {
-            // Simple pattern: "key":"value" or "key": "value"
             var pattern = $"\"{key}\"\\s*:\\s*\"([^\"]+)\"";
             var match = System.Text.RegularExpressions.Regex.Match(json, pattern);
-            return match.Success ? match.Groups[1].Value : null;
+            return match.Success ? UnescapeJsonString(match.Groups[1].Value) : null;
         }
 
         /// <summary>
@@ -1171,7 +1751,7 @@ namespace ClarionMarkdownEditor
         /// </summary>
         private string ExtractNestedJsonValue(string json, string parentKey, string childKey)
         {
-            // Find the "data" object first
+            // Find the parent object first
             var dataPattern = $"\"{parentKey}\"\\s*:\\s*\\{{([^}}]+)\\}}";
             var dataMatch = System.Text.RegularExpressions.Regex.Match(json, dataPattern);
             if (!dataMatch.Success) return null;
@@ -1181,7 +1761,7 @@ namespace ClarionMarkdownEditor
             // Look for string value
             var pattern = $"\"{childKey}\"\\s*:\\s*\"([^\"]+)\"";
             var match = System.Text.RegularExpressions.Regex.Match(dataContent, pattern);
-            if (match.Success) return match.Groups[1].Value;
+            if (match.Success) return UnescapeJsonString(match.Groups[1].Value);
 
             // Look for boolean/number value (no quotes)
             pattern = $"\"{childKey}\"\\s*:\\s*([^,}}\\s]+)";
@@ -1227,6 +1807,10 @@ namespace ClarionMarkdownEditor
                     }
                     break;
 
+                case "Reload":
+                    ReloadTabFromDisk(tabId, promptIfDirty: true);
+                    break;
+
                 case "CopyPath":
                     if (!string.IsNullOrEmpty(tab.FilePath))
                     {
@@ -1250,7 +1834,7 @@ namespace ClarionMarkdownEditor
         /// <summary>
         /// Calls JavaScript to add a new tab.
         /// </summary>
-        private async void AddTabToJs(string id, string fileName, string content, string filePath)
+        private async void AddTabToJs(string id, string fileName, string content, string filePath, bool isReadOnly = false, string baseUrl = null)
         {
             if (_isWebView2Ready)
             {
@@ -1263,11 +1847,11 @@ namespace ClarionMarkdownEditor
                     string escapedId = EscapeJsString(id);
                     string escapedFileName = EscapeJsString(fileName);
                     string escapedContent = EscapeJsString(normalizedContent);
-                    string escapedFilePath = filePath != null ? EscapeJsString(filePath) : "null";
+                    string filePathArg = filePath != null ? "\"" + EscapeJsString(filePath) + "\"" : "null";
+                    string readOnlyArg = isReadOnly ? "true" : "false";
+                    string baseUrlArg = !string.IsNullOrEmpty(baseUrl) ? "\"" + EscapeJsString(baseUrl) + "\"" : "null";
 
-                    var script = filePath != null
-                        ? $"addTab(\"{escapedId}\", \"{escapedFileName}\", \"{escapedContent}\", \"{escapedFilePath}\")"
-                        : $"addTab(\"{escapedId}\", \"{escapedFileName}\", \"{escapedContent}\", null)";
+                    var script = $"addTab(\"{escapedId}\", \"{escapedFileName}\", \"{escapedContent}\", {filePathArg}, {readOnlyArg}, {baseUrlArg})";
 
                     await webView.ExecuteScriptAsync(script);
                 }
@@ -1319,7 +1903,7 @@ namespace ClarionMarkdownEditor
         /// <summary>
         /// Calls JavaScript to update a tab's name and path.
         /// </summary>
-        private async void UpdateTabInJs(string tabId, string fileName, string filePath)
+        private async void UpdateTabInJs(string tabId, string fileName, string filePath, bool? isReadOnly = null)
         {
             if (_isWebView2Ready)
             {
@@ -1328,7 +1912,8 @@ namespace ClarionMarkdownEditor
                     string escapedId = EscapeJsString(tabId);
                     string escapedFileName = EscapeJsString(fileName);
                     string escapedFilePath = EscapeJsString(filePath);
-                    await webView.ExecuteScriptAsync($"updateTab(\"{escapedId}\", \"{escapedFileName}\", \"{escapedFilePath}\")");
+                    string readOnlyArg = isReadOnly.HasValue ? (isReadOnly.Value ? ", true" : ", false") : string.Empty;
+                    await webView.ExecuteScriptAsync($"updateTab(\"{escapedId}\", \"{escapedFileName}\", \"{escapedFilePath}\"{readOnlyArg})");
                 }
                 catch (Exception ex)
                 {
@@ -1386,14 +1971,7 @@ namespace ClarionMarkdownEditor
                 {
                     string escapedId = EscapeJsString(tabId);
                     var result = await webView.ExecuteScriptAsync($"getTabContent(\"{escapedId}\")");
-
-                    // Remove surrounding quotes from JSON string
-                    if (result.StartsWith("\"") && result.EndsWith("\""))
-                    {
-                        result = result.Substring(1, result.Length - 2);
-                        result = result.Replace("\\n", "\n").Replace("\\r", "\r").Replace("\\\"", "\"");
-                    }
-                    return result;
+                    return DecodeJsonString(result);
                 }
                 catch (Exception ex)
                 {
@@ -1432,12 +2010,31 @@ namespace ClarionMarkdownEditor
                 try
                 {
                     await webView.ExecuteScriptAsync("addStartPageTab()");
+                    _activeTabId = "startPage";
                     await RefreshRecentFilesInStartPage();
+                    await RefreshRecentUrlsInStartPage();
                 }
                 catch (Exception ex)
                 {
                     System.Diagnostics.Debug.WriteLine($"ShowStartPage error: {ex.Message}");
                 }
+            }
+        }
+
+        private async Task RefreshRecentUrlsInStartPage()
+        {
+            if (!_isWebView2Ready) return;
+            try
+            {
+                var urls = GetRecentUrls();
+                var jsonItems = urls.Select(u =>
+                    $"{{\"url\":\"{EscapeJsString(u)}\",\"name\":\"{EscapeJsString(DeriveTabNameFromUrl(u))}\"}}");
+                var jsonArray = "[" + string.Join(",", jsonItems) + "]";
+                await webView.ExecuteScriptAsync($"populateRecentUrls({jsonArray})");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"RefreshRecentUrlsInStartPage error: {ex.Message}");
             }
         }
 
@@ -1543,6 +2140,21 @@ namespace ClarionMarkdownEditor
             ShowStartPage();
         }
 
+        private async void menuDarkMode_Click(object sender, EventArgs e)
+        {
+            _isDarkMode = !_isDarkMode;
+            _settingsService.Set("DarkMode", _isDarkMode ? "true" : "false");
+            try
+            {
+                if (_isWebView2Ready)
+                    await webView.ExecuteScriptAsync(_isDarkMode ? "setDarkMode(true)" : "setDarkMode(false)");
+            }
+            catch (Exception ex)
+            {
+                Log($"menuDarkMode_Click error: {ex.Message}");
+            }
+        }
+
         private void menuAbout_Click(object sender, EventArgs e)
         {
             ShowAboutDialog();
@@ -1561,14 +2173,15 @@ namespace ClarionMarkdownEditor
         /// </summary>
         private void menuView_DropDownOpening(object sender, EventArgs e)
         {
-            // Clear all items except Start Page (first item)
-            while (menuView.DropDownItems.Count > 1)
+            // Clear all dynamic items (keep Start Page, separator, Dark Mode = first 3)
+            while (menuView.DropDownItems.Count > 3)
             {
-                menuView.DropDownItems.RemoveAt(1);
+                menuView.DropDownItems.RemoveAt(3);
             }
 
             // Check Start Page if it's active
             menuShowStartPage.Checked = (_activeTabId == "startPage" || string.IsNullOrEmpty(_activeTabId));
+            menuDarkMode.Checked = _isDarkMode;
 
             // Add separator if there are open tabs
             if (_openTabs.Count > 0)
@@ -1617,6 +2230,158 @@ namespace ClarionMarkdownEditor
                 SendContentToJs(content, _currentFilePath);
             }
         }
+
+        #region Auto-refresh (file watcher)
+
+        /// <summary>
+        /// Normalizes line endings to \n — the same form used when handing content
+        /// to the JavaScript editor — so on-disk and in-editor content compare equal.
+        /// </summary>
+        private static string NormalizeLineEndings(string content)
+        {
+            if (string.IsNullOrEmpty(content)) return content ?? string.Empty;
+            return content.Replace("\r\n", "\n").Replace("\r", "\n");
+        }
+
+        /// <summary>
+        /// Fired (on the UI thread) when a watched file changed on disk. Clean tabs
+        /// reload silently; tabs with unsaved edits get a passive "changed on disk"
+        /// badge so the user can resolve the conflict without losing work.
+        /// </summary>
+        private void OnDiskFileChanged(string filePath, string diskContent)
+        {
+            var tab = FindTabByPath(filePath);
+            if (tab == null) return;
+
+            string normalized = NormalizeLineEndings(diskContent);
+
+            // Our own save, or a touch that didn't actually change the text.
+            if (string.Equals(normalized, tab.DiskContent, StringComparison.Ordinal))
+                return;
+
+            tab.DiskContent = normalized;
+
+            if (!tab.IsDirty)
+            {
+                ReloadTabContentInJs(tab.Id, normalized);
+                SendMessageToJs("statusMessage", $"Reloaded {tab.FileName} — changed on disk");
+            }
+            else
+            {
+                // Don't clobber unsaved edits — flag for the user to resolve.
+                SetTabExternallyChangedInJs(tab.Id, true, false);
+            }
+        }
+
+        /// <summary>
+        /// Fired (on the UI thread) when a watched file was deleted/renamed away.
+        /// Keeps the in-editor buffer; just flags the tab.
+        /// </summary>
+        private void OnDiskFileRemoved(string filePath)
+        {
+            var tab = FindTabByPath(filePath);
+            if (tab == null) return;
+            SetTabExternallyChangedInJs(tab.Id, true, true);
+        }
+
+        private FileTab FindTabByPath(string filePath)
+        {
+            return _openTabs.Values.FirstOrDefault(t =>
+                !string.IsNullOrEmpty(t.FilePath) &&
+                string.Equals(t.FilePath, filePath, StringComparison.OrdinalIgnoreCase));
+        }
+
+        /// <summary>
+        /// Reloads a tab from its backing file. If the tab has unsaved edits and
+        /// <paramref name="promptIfDirty"/> is set, confirms before discarding them.
+        /// Invoked by the "Reload from disk" context-menu item and the badge click.
+        /// </summary>
+        private void ReloadTabFromDisk(string tabId, bool promptIfDirty)
+        {
+            if (!_openTabs.TryGetValue(tabId, out var tab)) return;
+
+            if (string.IsNullOrEmpty(tab.FilePath))
+            {
+                MessageBox.Show("This tab isn't saved to a file yet, so there's nothing to reload.",
+                    "Reload from Disk", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            if (!File.Exists(tab.FilePath))
+            {
+                MessageBox.Show($"The file no longer exists:\n{tab.FilePath}",
+                    "Reload from Disk", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (promptIfDirty && tab.IsDirty)
+            {
+                var result = MessageBox.Show(
+                    $"{tab.FileName} has unsaved changes, and the file has also changed on disk.\n\n" +
+                    "Load the version from disk and discard your unsaved changes?",
+                    "Reload from Disk",
+                    MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2);
+                if (result != DialogResult.Yes) return;
+            }
+
+            string content;
+            try
+            {
+                content = File.ReadAllText(tab.FilePath);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Couldn't read the file:\n{ex.Message}",
+                    "Reload from Disk", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+
+            string normalized = NormalizeLineEndings(content);
+            tab.DiskContent = normalized;
+            tab.IsDirty = false;
+            ReloadTabContentInJs(tabId, normalized);
+        }
+
+        /// <summary>
+        /// Calls JavaScript to replace a tab's content in place (preserving scroll)
+        /// and clear its dirty / changed-on-disk state.
+        /// </summary>
+        private async void ReloadTabContentInJs(string tabId, string content)
+        {
+            if (!_isWebView2Ready) return;
+            try
+            {
+                string escapedId = EscapeJsString(tabId);
+                string escapedContent = EscapeJsString(content);
+                await webView.ExecuteScriptAsync($"reloadTabContent(\"{escapedId}\", \"{escapedContent}\")");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"ReloadTabContentInJs error: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Calls JavaScript to toggle a tab's "changed on disk" badge.
+        /// </summary>
+        private async void SetTabExternallyChangedInJs(string tabId, bool changed, bool deleted)
+        {
+            if (!_isWebView2Ready) return;
+            try
+            {
+                string escapedId = EscapeJsString(tabId);
+                string changedArg = changed ? "true" : "false";
+                string deletedArg = deleted ? "true" : "false";
+                await webView.ExecuteScriptAsync(
+                    $"setTabExternallyChanged(\"{escapedId}\", {changedArg}, {deletedArg})");
+            }
+            catch (Exception ex)
+            {
+                System.Diagnostics.Debug.WriteLine($"SetTabExternallyChangedInJs error: {ex.Message}");
+            }
+        }
+
+        #endregion
     }
 
     /// <summary>
